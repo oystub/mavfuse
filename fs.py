@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from mavftp import MavFtpClient
 
 import os
 import sys
@@ -10,7 +11,7 @@ from dataclasses import dataclass
 import pyfuse3
 import pyfuse3.asyncio
 pyfuse3.asyncio.enable()
-from mavftp import list_directory, connect_mavlink
+
 
 @dataclass
 class File:
@@ -21,16 +22,9 @@ class File:
     parent: "File"
 
 
-shutdown_event = asyncio.Event()
-
-
-def handle_sigint():
-    shutdown_event.set()
-
-
 class MavFtpFS(pyfuse3.Operations):
-    def __init__(self, master):
-        self.master = master
+    def __init__(self, client: MavFtpClient):
+        self.client = client
         root_file = File(inode=pyfuse3.ROOT_INODE, path="", parent=None, size=0, type='directory')
         root_file.parent = root_file  # Root directory is its own parent
 
@@ -81,7 +75,7 @@ class MavFtpFS(pyfuse3.Operations):
 
     async def mavlink_opendir(self, dir: File):
         files = []
-        mavlink_entries = await list_directory(self.master, dir.path)
+        mavlink_entries = await self.client.list_directory(dir.path)
         for entry in mavlink_entries:
             if entry['type'] == 'skip':
                 continue
@@ -122,25 +116,29 @@ class MavFtpFS(pyfuse3.Operations):
             if not res:
                 break
             start_id += 1
-            
-
+           
 
 async def main(mountpoint):
-    asyncio.get_event_loop().add_signal_handler(signal.SIGINT, handle_sigint)
-    master = await connect_mavlink('/dev/ttyACM1')
+    shutdown_event = asyncio.Event()
+    asyncio.get_event_loop().add_signal_handler(
+        signal.SIGINT,
+        lambda: shutdown_event.set())
+    client = MavFtpClient()
+    await client.connect("/dev/ttyACM1")
+
     # Mount the filesystem
     fuse_options = set(pyfuse3.default_options)
     fuse_options.add('debug')
     fuse_options.add('ro')
     fuse_options.add('fsname=mavftp')
-    pyfuse3.init(MavFtpFS(master), mountpoint, fuse_options)
+    pyfuse3.init(MavFtpFS(client), mountpoint, fuse_options)
     asyncio.create_task(pyfuse3.main())
 
     # Wait for sigint
     await shutdown_event.wait()
 
     pyfuse3.close(unmount=True)
-    master.close()
+    client.close()
 
 
 if __name__ == '__main__':

@@ -1,14 +1,10 @@
 import asyncio
 from enum import Enum
 import struct
-import time
 from dataclasses import dataclass
 
 from pymavlink import mavutil
 
-ftp_lock = asyncio.Lock()
-ftp_q = asyncio.Queue()
-heartbeat_q = asyncio.Queue()
 
 class MavFtpOpcode(Enum):
     NONE = 0
@@ -50,22 +46,15 @@ class MavFtpPayload:
     data: bytes = b''
 
     MAV_FTP_MAX_DATA_LEN = 239
-    MAV_FTP_PACKET_LEN = 251  # 12 bytes fixed fields + 239 bytes data
-
-    _STRUCT_FORMAT = '<HBBBBBBI'  # Format: Little-endian, unsigned types
+    MAV_FTP_PACKET_LEN = 12 + MAV_FTP_MAX_DATA_LEN  # 12 bytes fixed fields
+    STRUCT_FORMAT = '<HBBBBBBI'  # Format: Little-endian, unsigned types
 
     @classmethod
     def from_bytes(cls, payload: bytes) -> 'MavFtpPayload':
-        """
-        Creates a MavFtpPayload instance by decoding the given payload.
-
-        :param payload: The bytes object containing the payload to decode.
-        :return: A MavFtpPayload instance.
-        """
-        fixed_size = struct.calcsize(cls._STRUCT_FORMAT)
+        fixed_size = struct.calcsize(cls.STRUCT_FORMAT)
         fixed_part = payload[:fixed_size]
         (seq_number, session, opcode, size, req_opcode,
-         burst_complete, padding, offset) = struct.unpack(cls._STRUCT_FORMAT, fixed_part)
+         burst_complete, padding, offset) = struct.unpack(cls.STRUCT_FORMAT, fixed_part)
         data = payload[fixed_size:fixed_size + cls.MAV_FTP_MAX_DATA_LEN]
         data = data[:size]
         return cls(
@@ -81,11 +70,6 @@ class MavFtpPayload:
         )
 
     def encode(self) -> bytes:
-        """
-        Encodes the MavFtpPayload fields into a bytes payload.
-
-        :return: A bytes object representing the encoded payload.
-        """
         if isinstance(self.opcode, Enum):
             opcode_val = self.opcode.value
         else:
@@ -97,7 +81,7 @@ class MavFtpPayload:
             req_opcode_val = self.req_opcode
 
         fixed_part = struct.pack(
-            self._STRUCT_FORMAT,
+            self.STRUCT_FORMAT,
             self.seq_number,
             self.session,
             opcode_val,
@@ -111,140 +95,149 @@ class MavFtpPayload:
         payload = fixed_part + data
         return payload
 
-    def __repr__(self):
-        return (f"MavFtpPayload(seq_number={self.seq_number}, "
-                f"session={self.session}, "
-                f"opcode={self.opcode}, "
-                f"size={self.size}, "
-                f"req_opcode={self.req_opcode}, "
-                f"burst_complete={self.burst_complete}, "
-                f"padding={self.padding}, "
-                f"offset={self.offset}, data={self.data})")
 
-async def send_heartbeats(master, interval=1):
-    while True:
-        master.mav.heartbeat_send(
-            type=mavutil.mavlink.MAV_TYPE_GCS,
-            autopilot=mavutil.mavlink.MAV_AUTOPILOT_GENERIC,
-            base_mode=0,
-            custom_mode=0,
-            system_status=mavutil.mavlink.MAV_STATE_ACTIVE
-        )
-        await asyncio.sleep(interval)
+class MavFtpClient:
+    def __init__(self):
+        self.shutdown_event = asyncio.Event()
+        self.conn = None
 
-async def receive_loop(master):
-    while True:
-        await asyncio.sleep(0.01)
-        while msg := master.recv_match(blocking=False):
-            # Run callback for all FTP messages
-            if msg.get_type() == 'FILE_TRANSFER_PROTOCOL':
-                ftp_q.put_nowait(msg)
-            elif msg.get_type() == 'HEARTBEAT':
-                heartbeat_q.put_nowait(msg)
+        self.ftp_lock = asyncio.Lock()
+        self.ftp_q = asyncio.Queue()
+        self.heartbeat_q = asyncio.Queue()
 
-async def connect_mavlink(connection_string):
-    master = mavutil.mavlink_connection(connection_string, baud=57600)
-    
-    # Start sending heartbeats in a background task
-    asyncio.create_task(send_heartbeats(master))
-    asyncio.create_task(receive_loop(master))
-    
-    # Wait for the first heartbeat response
-    print("Waiting for heartbeat...")
-    await heartbeat_q.get()
-    print(f"Connected to {connection_string}")
+    async def connect(self, connection_string):
+        self.conn = mavutil.mavlink_connection(connection_string, baud=57600)
+        self.heartbeats_task = asyncio.create_task(self.send_heartbeats())
+        self.receive_task = asyncio.create_task(self.receive_loop())
 
-    return master
+        # Wait for the first heartbeat response
+        print("Waiting for heartbeat...")
+        await self.heartbeat_q.get()
+        print(f"Connected to {connection_string}")
 
+    async def close(self):
+        self.shutdown_event.set()
+        await self.heartbeats_task
+        await self.receive_task
+        self.conn.close()
 
-def parse_nak(data) -> (MavFtpError):
-    if len(data) > 0:
-        return MavFtpError(data[0])
-    return None
-
-def decode_directory_listing(data):
-    """Decode the directory listing from the data."""
-    entries = data.split(b'\0')
-    parsed_entries = []
-    for entry in entries:
-        if entry:
-            if entry[0:1] == b'D':
-                entry_name = entry[1:].decode('utf-8', errors='ignore')
-                parsed_entries.append({"type": "directory", "name": entry_name})
-            elif entry[0:1] == b'F':
-                parts = entry[1:].split(b'\t')
-                if len(parts) == 2:
-                    entry_name = parts[0].decode('utf-8', errors='ignore')
-                    entry_size = int(parts[1])
-                    parsed_entries.append({"type": "file", "name": entry_name, "size": entry_size})
-            elif entry[0:1] == b'S':
-                parsed_entries.append({"type": "skip", "name": ""})
-    return parsed_entries
-
-async def list_directory(master, remote_path):
-    async with ftp_lock:
-        seq_number = 0
-        offset = 0
-        completed = False
-
-        files = []
-
-        print(f"Mavlink directory {remote_path}")
-        while not completed:
-            # Append the remote path to the payload
-            path_bytes = remote_path.encode('utf-8')
-
-            payload = MavFtpPayload(seq_number=seq_number, opcode=MavFtpOpcode.LIST_DIRECTORY.value, size=len(path_bytes), offset=offset, data=path_bytes)
-
-            # Send the request to list the directory
-            print(f"Sending directory list request: {payload}")
-            master.mav.file_transfer_protocol_send(
-                target_network=0,
-                target_system=master.target_system,
-                target_component=master.target_component,
-                payload=payload.encode()
+    async def send_heartbeats(self, interval=1):
+        while not self.shutdown_event.is_set():
+            self.conn.mav.heartbeat_send(
+                type=mavutil.mavlink.MAV_TYPE_GCS,
+                autopilot=mavutil.mavlink.MAV_AUTOPILOT_GENERIC,
+                base_mode=0,
+                custom_mode=0,
+                system_status=mavutil.mavlink.MAV_STATE_ACTIVE
             )
-            response = await ftp_q.get()
             try:
-                while True:
-                    ftp_q.get_nowait()
-            except asyncio.QueueEmpty:
-                pass
+                await asyncio.wait_for(
+                    self.shutdown_event.wait(),
+                    timeout=interval)
+            except asyncio.TimeoutError:
+                # Continue sending heartbeat after timeout
+                continue
 
-            if not response:
-                print("Failed to receive directory list response.")
-                break
-            decoded_response = MavFtpPayload.from_bytes(bytes(response.payload))
-            print(f"Received directory list response: {decoded_response}")
-
-            if decoded_response.opcode == MavFtpOpcode.NAK:
-                error_code = parse_nak(decoded_response.data)
-
-                if error_code == MavFtpError.EOF:
-                    # Directory listings are always terminated with an EOF
-                    completed = True
-                else:
-                    print(f"Error: {error_code.name}")
-                break
-
-            if decoded_response.seq_number != seq_number + 1 or decoded_response.req_opcode != MavFtpOpcode.LIST_DIRECTORY:
-                print("Unexpected response.")
-                break
-
-            files.extend(decode_directory_listing(decoded_response.data))
-            seq_number += 1
-            offset = max(len(files), 1)
-
-        return files
-
-async def main():
-    master = await connect_mavlink('/dev/ttyACM2')
-    list_directory_task = asyncio.create_task(list_directory(master, '/'))
-
-    dirs = await list_directory_task
-    print(dirs)
+    async def receive_loop(self):
+        while not self.shutdown_event.is_set():
+            while msg := self.conn.recv_match(blocking=False):
+                # Run callback for all FTP messages
+                if msg.get_type() == 'FILE_TRANSFER_PROTOCOL':
+                    try:
+                        self.ftp_q.put_nowait(msg)
+                    except asyncio.QueueFull:
+                        pass
+                elif msg.get_type() == 'HEARTBEAT':
+                    try:
+                        self.heartbeat_q.put_nowait(msg)
+                    except asyncio.QueueFull:
+                        pass
+            try:
+                await asyncio.wait_for(
+                    self.shutdown_event.wait(),
+                    timeout=0.001)
+            except asyncio.TimeoutError:
+                continue
     
+    async def clear_ftp_queue(self):
+        while True:
+            try:
+                self.ftp_q.get_nowait()
+            except asyncio.QueueEmpty:
+                return
 
+    @staticmethod
+    def parse_nak(data) -> (MavFtpError):
+        if len(data) > 0:
+            return MavFtpError(data[0])
+        return None
 
-if __name__ == "__main__":
-    asyncio.run(main())
+    @staticmethod 
+    def decode_directory_listing(data):
+        """Decode the directory listing from the data."""
+        entries = data.split(b'\0')
+        parsed_entries = []
+        for entry in entries:
+            if entry:
+                if entry[0:1] == b'D':
+                    entry_name = entry[1:].decode('utf-8', errors='ignore')
+                    parsed_entries.append({"type": "directory", "name": entry_name})
+                elif entry[0:1] == b'F':
+                    parts = entry[1:].split(b'\t')
+                    if len(parts) == 2:
+                        entry_name = parts[0].decode('utf-8', errors='ignore')
+                        entry_size = int(parts[1])
+                        parsed_entries.append({"type": "file", "name": entry_name, "size": entry_size})
+                elif entry[0:1] == b'S':
+                    parsed_entries.append({"type": "skip", "name": ""})
+        return parsed_entries
+
+    async def list_directory(self, remote_path):
+        async with self.ftp_lock:
+            # Ensure no old messages are in the queue
+            self.clear_ftp_queue()
+
+            seq_number = 0
+            offset = 0
+            completed = False
+
+            files = []
+
+            print(f"Mavlink directory {remote_path}")
+            while not completed:
+                path_bytes = remote_path.encode('utf-8')
+                payload = MavFtpPayload(seq_number=seq_number, opcode=MavFtpOpcode.LIST_DIRECTORY.value, size=len(path_bytes), offset=offset, data=path_bytes)
+
+                self.conn.mav.file_transfer_protocol_send(
+                    target_network=0,
+                    target_system=self.conn.target_system,
+                    target_component=self.conn.target_component,
+                    payload=payload.encode()
+                )
+                try:
+                    response = await asyncio.wait_for(self.ftp_q.get(), timeout=1)
+                except asyncio.TimeoutError:
+                    print("Timed out waiting for directory list response.")
+                    break
+
+                decoded_response = MavFtpPayload.from_bytes(bytes(response.payload))
+
+                if decoded_response.opcode == MavFtpOpcode.NAK:
+                    error_code = self.parse_nak(decoded_response.data)
+
+                    if error_code == MavFtpError.EOF:
+                        # Directory listings are always terminated with an EOF
+                        completed = True
+                    else:
+                        print(f"Error: {error_code.name}")
+                    break
+
+                if decoded_response.seq_number != seq_number + 1 or decoded_response.req_opcode != MavFtpOpcode.LIST_DIRECTORY:
+                    print("Error: Unexpected response.")
+                    break
+
+                files.extend(self.decode_directory_listing(decoded_response.data))
+                seq_number += 1
+                offset = max(len(files), 1)
+
+            return files
