@@ -25,7 +25,8 @@ class File:
 class MavFtpFS(pyfuse3.Operations):
     def __init__(self, client: MavFtpClient):
         self.client = client
-        root_file = File(inode=pyfuse3.ROOT_INODE, path="", parent=None, size=0, type='directory')
+        root_file = File(inode=pyfuse3.ROOT_INODE, path="",
+                         parent=None, size=0, type='directory')
         root_file.parent = root_file  # Root directory is its own parent
 
         self.files_by_inode = {
@@ -41,7 +42,8 @@ class MavFtpFS(pyfuse3.Operations):
         entry = pyfuse3.EntryAttributes()
         if inode in self.files_by_inode:
             file = self.files_by_inode[inode]
-            entry.st_mode = (stat.S_IFDIR | 0o755) if file.type == 'directory' else (stat.S_IFREG | 0o644)
+            entry.st_mode = (stat.S_IFDIR | 0o755) if file.type == 'directory' else (
+                stat.S_IFREG | 0o644)
             entry.st_size = file.size
         else:
             raise pyfuse3.FUSEError(errno.ENOENT)
@@ -67,9 +69,9 @@ class MavFtpFS(pyfuse3.Operations):
             if full_path not in self.files_by_path:
                 # Still not found, raise ENOENT
                 raise pyfuse3.FUSEError(errno.ENOENT)
-        
+
         return await self.getattr(self.files_by_path[full_path].inode)
-    
+
     async def opendir(self, inode, ctx):
         return inode
 
@@ -80,7 +82,8 @@ class MavFtpFS(pyfuse3.Operations):
             if entry['type'] == 'skip':
                 continue
             # Check if the file already exists, then we can reuse the inode
-            existing_file = self.files_by_path.get(dir.path + "/" + entry['name'], None)
+            existing_file = self.files_by_path.get(
+                dir.path + "/" + entry['name'], None)
             if existing_file is None:
                 # If not, create a new inode
                 inode = self.inode_counter
@@ -99,12 +102,12 @@ class MavFtpFS(pyfuse3.Operations):
             self.files_by_path[f.path] = f
 
             files.append((str(entry['name']), f))
-        
+
         return files
 
     async def readdir(self, fh, start_id, token):
         dir = self.files_by_inode[fh]
-        
+
         dir_files = [
             (".", dir),
             ("..", dir.parent)
@@ -112,11 +115,11 @@ class MavFtpFS(pyfuse3.Operations):
         dir_files.extend(await self.mavlink_opendir(dir))
         # Iterate, starting at the requested ID
         for f in dir_files[start_id:]:
-            res = pyfuse3.readdir_reply(token, f[0].encode("utf-8"),  await self.getattr(f[1].inode), start_id+1)
+            res = pyfuse3.readdir_reply(token, f[0].encode("utf-8"), await self.getattr(f[1].inode), start_id+1)
             if not res:
                 break
             start_id += 1
-           
+
 
 async def main(mountpoint):
     shutdown_event = asyncio.Event()

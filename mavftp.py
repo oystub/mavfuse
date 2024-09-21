@@ -74,7 +74,7 @@ class MavFtpPayload:
             opcode_val = self.opcode.value
         else:
             opcode_val = self.opcode
-        
+
         if isinstance(self.req_opcode, Enum):
             req_opcode_val = self.req_opcode.value
         else:
@@ -158,7 +158,7 @@ class MavFtpClient:
                     timeout=0.001)
             except asyncio.TimeoutError:
                 continue
-    
+
     async def clear_ftp_queue(self):
         while True:
             try:
@@ -172,7 +172,7 @@ class MavFtpClient:
             return MavFtpError(data[0])
         return None
 
-    @staticmethod 
+    @staticmethod
     def decode_directory_listing(data):
         """Decode the directory listing from the data."""
         entries = data.split(b'\0')
@@ -181,13 +181,15 @@ class MavFtpClient:
             if entry:
                 if entry[0:1] == b'D':
                     entry_name = entry[1:].decode('utf-8', errors='ignore')
-                    parsed_entries.append({"type": "directory", "name": entry_name})
+                    parsed_entries.append(
+                        {"type": "directory", "name": entry_name})
                 elif entry[0:1] == b'F':
                     parts = entry[1:].split(b'\t')
                     if len(parts) == 2:
                         entry_name = parts[0].decode('utf-8', errors='ignore')
                         entry_size = int(parts[1])
-                        parsed_entries.append({"type": "file", "name": entry_name, "size": entry_size})
+                        parsed_entries.append(
+                            {"type": "file", "name": entry_name, "size": entry_size})
                 elif entry[0:1] == b'S':
                     parsed_entries.append({"type": "skip", "name": ""})
         return parsed_entries
@@ -206,7 +208,8 @@ class MavFtpClient:
             print(f"Mavlink directory {remote_path}")
             while not completed:
                 path_bytes = remote_path.encode('utf-8')
-                payload = MavFtpPayload(seq_number=seq_number, opcode=MavFtpOpcode.LIST_DIRECTORY.value, size=len(path_bytes), offset=offset, data=path_bytes)
+                payload = MavFtpPayload(seq_number=seq_number, opcode=MavFtpOpcode.LIST_DIRECTORY.value, size=len(
+                    path_bytes), offset=offset, data=path_bytes)
 
                 self.conn.mav.file_transfer_protocol_send(
                     target_network=0,
@@ -220,7 +223,8 @@ class MavFtpClient:
                     print("Timed out waiting for directory list response.")
                     break
 
-                decoded_response = MavFtpPayload.from_bytes(bytes(response.payload))
+                decoded_response = MavFtpPayload.from_bytes(
+                    bytes(response.payload))
 
                 if decoded_response.opcode == MavFtpOpcode.NAK:
                     error_code = self.parse_nak(decoded_response.data)
@@ -236,7 +240,8 @@ class MavFtpClient:
                     print("Error: Unexpected response.")
                     break
 
-                files.extend(self.decode_directory_listing(decoded_response.data))
+                files.extend(self.decode_directory_listing(
+                    decoded_response.data))
                 seq_number += 1
                 offset = max(len(files), 1)
 
