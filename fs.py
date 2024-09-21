@@ -141,7 +141,7 @@ async def main(mountpoint):
     await shutdown_event.wait()
 
     pyfuse3.close(unmount=True)
-    client.close()
+    await client.close()
 
 
 if __name__ == '__main__':
