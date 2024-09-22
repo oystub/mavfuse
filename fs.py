@@ -62,14 +62,15 @@ class MavFtpFS(pyfuse3.Operations):
         return entry
 
     async def lookup(self, parent_inode, name, ctx=None):
+        name_str = name.decode("utf-8")
         parent = self.files_by_inode.get(parent_inode, None)
         if parent is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
-        full_path = parent.path + "/" + str(name)
+        full_path = parent.path + "/" + name_str
         # Handle "." and ".."
-        if name == '.':
+        if name_str == '.':
             return await self.getattr(parent_inode)
-        elif name == '..':
+        elif name_str == '..':
             return await self.getattr(parent.parent.inode)
         elif full_path not in self.files_by_path:
             # Check directory listing
@@ -155,14 +156,14 @@ class MavFtpFS(pyfuse3.Operations):
             f = File(
                 inode=inode,
                 parent=dir,
-                path=dir.path + "/" + str(entry['name']),
+                path=dir.path + "/" + entry['name'],
                 size=entry.get('size', 0),
                 type=entry['type']
             )
             self.files_by_inode[f.inode] = f
             self.files_by_path[f.path] = f
 
-            files.append((str(entry['name']), f))
+            files.append(entry['name'], f)
 
         return files
 
