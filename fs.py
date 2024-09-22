@@ -163,7 +163,7 @@ class MavFtpFS(pyfuse3.Operations):
             self.files_by_inode[f.inode] = f
             self.files_by_path[f.path] = f
 
-            files.append(entry['name'], f)
+            files.append((entry['name'], f))
 
         return files
 
