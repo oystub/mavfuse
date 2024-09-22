@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 from pymavlink import mavutil
 from received_burst_data import ReceivedBurstData
+from typing import Optional
 
 
 class MavFtpOpcode(Enum):
@@ -101,24 +102,24 @@ class MavFtpPayload:
 
 class MavFtpClient:
     def __init__(self):
-        self.shutdown_event = asyncio.Event()
-        self.conn = None
+        self._shutdown_event = asyncio.Event()
+        self._conn: Optional[mavutil.mavfile] = None
 
-        self.ftp_lock = asyncio.Lock()
-        self.ftp_q = asyncio.Queue()
-        self.heartbeat_q = asyncio.Queue()
+        self._ftp_lock = asyncio.Lock()
+        self._ftp_q = asyncio.Queue()
+        self._heartbeat_q = asyncio.Queue()
 
-        self.session = None
-        self.session_path = None
-        self.session_type = None
+        self._session: Optional[int] = None
+        self._session_path: Optional[str] = None
+        self._session_type = Optional[MavFtpOpcode] = None
 
-        self.seq_num = 1
+        self.seq_num: int = 1
 
-    def create_seq_number(self):
+    def _create_seq_number(self) -> int:
         self.seq_num = (self.seq_num + 1) % 65536
         return self.seq_num
-    
-    def receive_seq_number(self, payload) -> bool:
+
+    def _receive_seq_number(self, payload) -> bool:
         diff = (payload.seq_number - self.seq_num) % 65536
         if diff == 0:
             # Duplicate packet
@@ -138,29 +139,27 @@ class MavFtpClient:
             print(f"Warn: Dropping packet with seq number {payload.seq_number}, expected {self.seq_num}")
             return False
 
-        
-
-    async def connect(self, connection_string):
-        self.conn = mavutil.mavlink_connection(connection_string, baud=57600)
-        self.heartbeats_task = asyncio.create_task(self.send_heartbeats())
-        self.receive_task = asyncio.create_task(self.receive_loop())
+    async def connect(self, connection_string) -> None:
+        self._conn = mavutil.mavlink_connection(connection_string, baud=57600)
+        self.heartbeats_task = asyncio.create_task(self._send_heartbeats())
+        self.receive_task = asyncio.create_task(self._receive_loop())
 
         # Wait for the first heartbeat response
         print("Waiting for heartbeat...")
-        await self.heartbeat_q.get()
+        await self._heartbeat_q.get()
         print(f"Connected to {connection_string}")
 
     async def close(self):
-        async with self.ftp_lock:
-            await self.close_session()
-        self.shutdown_event.set()
+        async with self._ftp_lock:
+            await self._close_session()
+        self._shutdown_event.set()
         await self.heartbeats_task
         await self.receive_task
-        self.conn.close()
+        self._conn.close()
 
-    async def send_heartbeats(self, interval=1):
-        while not self.shutdown_event.is_set():
-            self.conn.mav.heartbeat_send(
+    async def _send_heartbeats(self, interval=1) -> None:
+        while not self._shutdown_event.is_set():
+            self._conn.mav.heartbeat_send(
                 type=mavutil.mavlink.MAV_TYPE_GCS,
                 autopilot=mavutil.mavlink.MAV_AUTOPILOT_GENERIC,
                 base_mode=0,
@@ -169,50 +168,50 @@ class MavFtpClient:
             )
             try:
                 await asyncio.wait_for(
-                    self.shutdown_event.wait(),
+                    self._shutdown_event.wait(),
                     timeout=interval)
             except asyncio.TimeoutError:
                 # Continue sending heartbeat after timeout
                 continue
 
-    async def receive_loop(self):
-        while not self.shutdown_event.is_set():
-            while msg := self.conn.recv_match(blocking=False):
+    async def _receive_loop(self) -> None:
+        while not self._shutdown_event.is_set():
+            while msg := self._conn.recv_match(blocking=False):
                 # Run callback for all FTP messages
                 if msg.get_type() == 'FILE_TRANSFER_PROTOCOL':
                     try:
                         payload = MavFtpPayload.from_bytes(bytes(msg.payload))
-                        if self.receive_seq_number(payload):
-                            self.ftp_q.put_nowait(payload)
+                        if self._receive_seq_number(payload):
+                            self._ftp_q.put_nowait(payload)
                     except asyncio.QueueFull:
                         pass
                 elif msg.get_type() == 'HEARTBEAT':
                     try:
-                        self.heartbeat_q.put_nowait(msg)
+                        self._heartbeat_q.put_nowait(msg)
                     except asyncio.QueueFull:
                         pass
             try:
                 await asyncio.wait_for(
-                    self.shutdown_event.wait(),
+                    self._shutdown_event.wait(),
                     timeout=0.001)
             except asyncio.TimeoutError:
                 continue
 
-    async def clear_ftp_queue(self):
+    async def _clear_ftp_queue(self) -> None:
         while True:
             try:
-                self.ftp_q.get_nowait()
+                self._ftp_q.get_nowait()
             except asyncio.QueueEmpty:
                 return
 
     @staticmethod
-    def parse_nak(data) -> (MavFtpError):
+    def _parse_nak(data) -> Optional[MavFtpError]:
         if len(data) > 0:
             return MavFtpError(data[0])
         return None
 
     @staticmethod
-    def decode_directory_listing(data):
+    def _decode_directory_listing(data):
         """Decode the directory listing from the data."""
         entries = data.split(b'\0')
         parsed_entries = []
@@ -232,28 +231,28 @@ class MavFtpClient:
                 elif entry[0:1] == b'S':
                     parsed_entries.append({"type": "skip", "name": ""})
         return parsed_entries
-    
-    async def op_list_directory(self, remote_path):
-        async with self.ftp_lock:
-            await self.clear_ftp_queue()
-            return await self.list_directory(remote_path)
-    async def list_directory(self, remote_path):
-        offset = 0
 
+    async def list_directory(self, remote_path):
+        async with self._ftp_lock:
+            await self._clear_ftp_queue()
+            return await self._list_directory(remote_path)
+
+    async def _list_directory(self, remote_path):
+        offset = 0
         files = []
 
         while True:
             path_bytes = remote_path.encode('utf-8')
-            payload = MavFtpPayload(seq_number=self.create_seq_number(), opcode=MavFtpOpcode.LIST_DIRECTORY.value, size=len(
+            payload = MavFtpPayload(seq_number=self._create_seq_number(), opcode=MavFtpOpcode.LIST_DIRECTORY.value, size=len(
                 path_bytes), offset=offset, data=path_bytes)
-            self.conn.mav.file_transfer_protocol_send(
+            self._conn.mav.file_transfer_protocol_send(
                 target_network=0,
-                target_system=self.conn.target_system,
-                target_component=self.conn.target_component,
+                target_system=self._conn.target_system,
+                target_component=self._conn.target_component,
                 payload=payload.encode()
             )
             try:
-                decoded_response = await asyncio.wait_for(self.ftp_q.get(), timeout=1)
+                decoded_response = await asyncio.wait_for(self._ftp_q.get(), timeout=1)
             except asyncio.TimeoutError:
                 print("Timed out waiting for directory list response.")
                 return
@@ -264,7 +263,7 @@ class MavFtpClient:
 
             if decoded_response.opcode != MavFtpOpcode.ACK:
                 if decoded_response.opcode == MavFtpOpcode.NAK:
-                    error_code = self.parse_nak(decoded_response.data)
+                    error_code = self._parse_nak(decoded_response.data)
 
                     if error_code == MavFtpError.EOF:
                         # Directory listings are always terminated with an EOF
@@ -276,87 +275,86 @@ class MavFtpClient:
                     print("Error: Unexpected response. Expected opcode ACK or NAK.")
                     return
 
-            files.extend(self.decode_directory_listing(
+            files.extend(self._decode_directory_listing(
                 decoded_response.data))
             offset = max(len(files), 1)
 
         return files
-    
-    async def op_close_session(self, session_path):
-        async with self.ftp_lock:
-            return await self.close_session(session_path)
 
-    async def close_session(self, session_path=None):
-        if session_path is not None and self.session_path != session_path:
+    async def close_session(self, session_path) -> None:
+        async with self._ftp_lock:
+            return await self._close_session(session_path)
+
+    async def _close_session(self, session_path=None) -> None:
+        if session_path is not None and self._session_path != session_path:
             # Already closed
             return
 
-        if self.session is not None:
+        if self._session is not None:
             payload = MavFtpPayload(
-                session=self.session,
-                seq_number=self.create_seq_number(),
+                session=self._session,
+                seq_number=self._create_seq_number(),
                 opcode=MavFtpOpcode.TERMINATE_SESSION
             )
-            self.conn.mav.file_transfer_protocol_send(
+            self._conn.mav.file_transfer_protocol_send(
                 target_network=0,
-                target_system=self.conn.target_system,
-                target_component=self.conn.target_component,
+                target_system=self._conn.target_system,
+                target_component=self._conn.target_component,
                 payload=payload.encode()
             )
-            
+
             try:
-                decoded_response = await asyncio.wait_for(self.ftp_q.get(), timeout=1)
+                decoded_response = await asyncio.wait_for(self._ftp_q.get(), timeout=1)
             except asyncio.TimeoutError:
                 print("Timed out waiting for TERMINATE_SESSION response.")
                 return
-            
+
             if decoded_response.req_opcode != MavFtpOpcode.TERMINATE_SESSION:
                 print("Error: Unexpected response. Expected req_opcode TERMINATE_SESSION.")
                 return
-            
+
             if decoded_response.opcode != MavFtpOpcode.ACK:
                 if decoded_response.opcode == MavFtpOpcode.NAK:
-                    error_code = self.parse_nak(decoded_response.data)
+                    error_code = self._parse_nak(decoded_response.data)
                     print(f"Error: {error_code.name}")
                     return
                 print("Error: Unexpected response. Expected opcode ACK.")
                 return
-            print(f"Closed session {self.session}")
-            self.session = None
+            print(f"Closed session {self._session}")
+            self._session = None
             self.session_id = None
-            
-
-    async def op_open_file_ro(self, path):
-        async with self.ftp_lock:
-            await self.clear_ftp_queue()
-            return await self.open_file_ro(path)
 
     async def open_file_ro(self, path) -> bool:
-        if self.session is not None and self.session_path == path:
+        async with self._ftp_lock:
+            await self._clear_ftp_queue()
+            return await self._open_file_ro(path)
+
+    async def _open_file_ro(self, path) -> bool:
+        if self._session is not None and self._session_path == path:
             # Already open
             return True
 
         # Close any existing sessions, we only support one session at a time
-        await self.close_session()
+        await self._close_session()
 
         path_bytes = path.encode('utf-8')
 
         payload = MavFtpPayload(
-            seq_number=self.create_seq_number(),
+            seq_number=self._create_seq_number(),
             opcode=MavFtpOpcode.OPEN_FILE_RO,
             size=len(path_bytes),
             data=path_bytes,
         )
 
-        self.conn.mav.file_transfer_protocol_send(
+        self._conn.mav.file_transfer_protocol_send(
             target_network=0,
-            target_system=self.conn.target_system,
-            target_component=self.conn.target_component,
+            target_system=self._conn.target_system,
+            target_component=self._conn.target_component,
             payload=payload.encode()
         )
 
         try:
-            response = await asyncio.wait_for(self.ftp_q.get(), timeout=1)
+            response = await asyncio.wait_for(self._ftp_q.get(), timeout=1)
         except asyncio.TimeoutError:
             print("Timed out waiting for response.")
             return False
@@ -364,30 +362,30 @@ class MavFtpClient:
         if response.req_opcode != MavFtpOpcode.OPEN_FILE_RO:
             print("Error: Unexpected response. Expected req_opcode OPEN_FILE_RO.")
             return False
-        
+
         if response.opcode != MavFtpOpcode.ACK:
             if response.opcode == MavFtpOpcode.NAK:
-                error_code = self.parse_nak(response.data)
+                error_code = self._parse_nak(response.data)
                 print(f"Error: {error_code.name}")
                 return False
             print("Error: Unexpected response. Expected opcode ACK.")
             return False
-        
-        self.session = response.session
-        self.session_path = path
-        self.session_type = MavFtpOpcode.OPEN_FILE_RO
+
+        self._session = response.session
+        self._session_path = path
+        self._session_type = MavFtpOpcode.OPEN_FILE_RO
 
         return True
-    
-    async def op_read_file(self, path, offset, size):
-        async with self.ftp_lock:
-            await self.clear_ftp_queue()
-            return await self.read_file(path, offset, size)
 
-    async def read_file(self, path, offset, size):
+    async def read_file(self, path, offset, size) -> Optional[bytearray]:
+        async with self._ftp_lock:
+            await self._clear_ftp_queue()
+            return await self._read_file(path, offset, size)
+
+    async def _read_file(self, path, offset, size) -> Optional[bytearray]:
         # Need to open the file first, if not already open
-        if self.session_path != path or self.session_type != MavFtpOpcode.OPEN_FILE_RO:
-            if not await self.open_file_ro(path):
+        if self._session_path != path or self._session_type != MavFtpOpcode.OPEN_FILE_RO:
+            if not await self._open_file_ro(path):
                 return None
         received_data = ReceivedBurstData(offset, size)
 
@@ -396,26 +394,26 @@ class MavFtpClient:
             if next_missing is None:
                 break
             payload = MavFtpPayload(
-                session=self.session,
-                seq_number=self.create_seq_number(),
+                session=self._session,
+                seq_number=self._create_seq_number(),
                 opcode=MavFtpOpcode.BURST_READ_FILE,
                 offset=next_missing[0],
                 size=min(next_missing[1], MavFtpPayload.MAV_FTP_MAX_DATA_LEN),
             )
-            self.conn.mav.file_transfer_protocol_send(
+            self._conn.mav.file_transfer_protocol_send(
                 target_network=0,
-                target_system=self.conn.target_system,
-                target_component=self.conn.target_component,
+                target_system=self._conn.target_system,
+                target_component=self._conn.target_component,
                 payload=payload.encode()
             )
 
             while True:
                 try:
-                    decoded_response = await asyncio.wait_for(self.ftp_q.get(), timeout=1)
+                    decoded_response = await asyncio.wait_for(self._ftp_q.get(), timeout=1)
                 except asyncio.TimeoutError:
                     print("Timed out waiting for burst to complete.")
                     return None
-                
+
                 if not decoded_response.req_opcode == MavFtpOpcode.BURST_READ_FILE:
                     print("Error: Unexpected response. Expected req_opcode BURST_READ_FILE.")
                     return None
@@ -424,7 +422,7 @@ class MavFtpClient:
                     if decoded_response.burst_complete:
                         break
                 elif decoded_response.opcode == MavFtpOpcode.NAK:
-                    error_code = self.parse_nak(decoded_response.data)
+                    error_code = self._parse_nak(decoded_response.data)
                     if error_code == MavFtpError.EOF:
                         received_data.eof(decoded_response.offset)
                         break
@@ -435,4 +433,3 @@ class MavFtpClient:
                     return None
         data = received_data.get_data()
         return data
-        
