@@ -111,7 +111,7 @@ class MavFtpClient:
 
         self._session: Optional[int] = None
         self._session_path: Optional[str] = None
-        self._session_type = Optional[MavFtpOpcode] = None
+        self._session_type: Optional[MavFtpOpcode] = None
 
         self.seq_num: int = 1
 
