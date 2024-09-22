@@ -2,11 +2,12 @@
 from mavftp import MavFtpClient
 
 import os
-import sys
+import argparse
 import errno
 import asyncio
 import signal
 import stat
+import time
 from dataclasses import dataclass
 import pyfuse3
 import pyfuse3.asyncio
@@ -35,8 +36,10 @@ class MavFtpFS(pyfuse3.Operations):
         self.files_by_path = {
             '': self.files_by_inode[pyfuse3.ROOT_INODE]
         }
+        self.files_by_handle = {}
 
         self.inode_counter = pyfuse3.ROOT_INODE + 1
+        self.fh_counter = 0
 
     async def getattr(self, inode, ctx=None):
         entry = pyfuse3.EntryAttributes()
@@ -47,8 +50,8 @@ class MavFtpFS(pyfuse3.Operations):
             entry.st_size = file.size
         else:
             raise pyfuse3.FUSEError(errno.ENOENT)
-
-        stamp = int(1438467123.985654 * 1e9)
+        
+        stamp = time.time_ns()
         entry.st_atime_ns = stamp
         entry.st_ctime_ns = stamp
         entry.st_mtime_ns = stamp
@@ -63,7 +66,12 @@ class MavFtpFS(pyfuse3.Operations):
         if parent is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
         full_path = parent.path + "/" + str(name)
-        if full_path not in self.files_by_path:
+        # Handle 
+        if name == '.':
+            return await self.getattr(parent_inode)
+        elif name == '..':
+            return await self.getattr(parent.parent.inode)
+        elif full_path not in self.files_by_path:
             # Check directory listing
             await self.mavlink_opendir(parent)
             if full_path not in self.files_by_path:
@@ -73,11 +81,64 @@ class MavFtpFS(pyfuse3.Operations):
         return await self.getattr(self.files_by_path[full_path].inode)
 
     async def opendir(self, inode, ctx):
-        return inode
+        if inode not in self.files_by_inode:
+            raise pyfuse3.FUSEError(errno.ENOENT)
 
+        fh = self.fh_counter
+        self.fh_counter += 1
+        self.files_by_handle[fh] = self.files_by_inode[inode]
+        return fh
+    
+    async def open(self, inode, flags, ctx):
+        if inode not in self.files_by_inode:
+            raise pyfuse3.FUSEError(errno.ENOENT)
+        
+        # Is the file already open?
+        for fh, file in self.files_by_handle.items():
+            if file.inode == inode:
+                return pyfuse3.FileInfo(fh=fh, direct_io=True, keep_cache=False, nonseekable=False)
+        
+        if not await self.client.op_open_file_ro(self.files_by_inode[inode].path):
+            raise pyfuse3.FUSEError(errno.EIO)
+
+        fh = self.fh_counter
+        self.fh_counter += 1
+        self.files_by_handle[fh] = self.files_by_inode[inode]
+        return pyfuse3.FileInfo(fh=fh, direct_io=True, keep_cache=False, nonseekable=False)
+    
+    async def read(self, fh, offset, length):
+        if fh not in self.files_by_handle:
+            raise pyfuse3.FUSEError(errno.EBADF)
+        
+        file = self.files_by_handle[fh]
+        if file.type == 'directory':
+            raise pyfuse3.FUSEError(errno.EISDIR)
+        
+        data = await self.client.op_read_file(file.path, offset, length)
+        if data is None:
+            raise pyfuse3.FUSEError(errno.EIO)
+        
+        return data
+    
+    async def release(self, fh) -> None:
+        if fh in self.files_by_handle:
+            await self.client.op_close_session(self.files_by_handle[fh].path)
+            try:
+                del self.files_by_handle[fh]
+            except KeyError:
+                print(f"Warn: Tried to remove non-existent file handle {fh}")
+        else:
+            raise pyfuse3.FUSEError(errno.EBADF)
+    
+    async def releasedir(self, fh):
+        if fh in self.files_by_handle:
+            del self.files_by_handle[fh]
+        else:
+            raise pyfuse3.FUSEError(errno.EBADF)
+    
     async def mavlink_opendir(self, dir: File):
         files = []
-        mavlink_entries = await self.client.list_directory(dir.path)
+        mavlink_entries = await self.client.op_list_directory(dir.path)
         for entry in mavlink_entries:
             if entry['type'] == 'skip':
                 continue
@@ -106,7 +167,9 @@ class MavFtpFS(pyfuse3.Operations):
         return files
 
     async def readdir(self, fh, start_id, token):
-        dir = self.files_by_inode[fh]
+        dir = self.files_by_handle.get(fh, None)
+        if dir is None:
+            raise pyfuse3.FUSEError(errno.ENOENT)
 
         dir_files = [
             (".", dir),
@@ -120,20 +183,35 @@ class MavFtpFS(pyfuse3.Operations):
                 break
             start_id += 1
 
+shutdown_event = asyncio.Event()
 
-async def main(mountpoint):
-    shutdown_event = asyncio.Event()
+def sigint_handler():
+    if shutdown_event.is_set():
+        print("Forcing exit")
+        os._exit(1)
+    
+    shutdown_event.set()
+
+
+async def main(connection_str: str, mountpoint: str, write_mode: bool = False):
     asyncio.get_event_loop().add_signal_handler(
         signal.SIGINT,
-        lambda: shutdown_event.set())
+        sigint_handler)
     client = MavFtpClient()
-    await client.connect("/dev/ttyACM1")
+    try:
+        await asyncio.wait_for(client.connect(connection_str), timeout=5)
+    except asyncio.TimeoutError:
+        print("MAVLink connection timed out")
+        return
 
     # Mount the filesystem
     fuse_options = set(pyfuse3.default_options)
     fuse_options.add('debug')
+    fuse_options.add('auto_unmount')
     fuse_options.add('ro')
-    fuse_options.add('fsname=mavftp')
+    fuse_options.add('sync')
+    fuse_options.add('dirsync')
+    fuse_options.add('noatime')
     pyfuse3.init(MavFtpFS(client), mountpoint, fuse_options)
     asyncio.create_task(pyfuse3.main())
 
@@ -145,7 +223,21 @@ async def main(mountpoint):
 
 
 if __name__ == '__main__':
-    if len(sys.argv) != 2:
-        print('Usage: {} <mountpoint>'.format(sys.argv[0]))
-        sys.exit(1)
-    asyncio.run(main(sys.argv[1]))
+    # Setup argparse
+    parser = argparse.ArgumentParser(description='Connect to a MAVLink vehicle and specify a mountpoint.')
+    
+    # Positional argument for the MAVLink connection string
+    parser.add_argument('connection_string', type=str, 
+                        help='MAVLink connection string (e.g., udpin:localhost:14540, /dev/ttyUSB0, tcp:127.0.0.1:5760)')
+    
+    # Positional argument for the mountpoint
+    parser.add_argument('mountpoint', type=str, 
+                        help='Mountpoint path (e.g., /mnt/mavlink)')
+    
+    # Optional flag for write mode
+    parser.add_argument('-w', '--write', action='store_true', 
+                        help='Enable write mode (optional, default is read-only).')
+
+    # Parse the arguments
+    args = parser.parse_args()
+    asyncio.run(main(args.connection_string, args.mountpoint, args.write))
