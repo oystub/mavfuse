@@ -4,6 +4,7 @@ from sortedcontainers import SortedDict
 class ReceivedBurstData:
     def __init__(self, offset, total_size):
         self._initial_offset = offset
+        self._initial_size = total_size
         self._total_size = total_size
         self._data = bytearray()
 
@@ -45,7 +46,7 @@ class ReceivedBurstData:
             self._data[start-self._initial_offset:end-self._initial_offset] = data
 
     def eof(self, offset):
-        self.mark_completed(offset, self._total_size+self._initial_offset-offset)
+        self.mark_completed(offset, self._total_size-(offset-self._initial_offset))
         self._total_size = offset-self._initial_offset
 
     def get_missing(self):

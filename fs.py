@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
-from mavftp import MavFtpClient
-
-import os
 import argparse
-import errno
 import asyncio
+import errno
+import os
 import signal
 import stat
 import time
+import threading
+import struct
 from dataclasses import dataclass
+
 import pyfuse3
 import pyfuse3.asyncio
+
+from mavftp import MavFtpClient
+from ulog_parse import parse_ulog
+
 pyfuse3.asyncio.enable()
 
 
@@ -24,27 +29,28 @@ class File:
 
 
 class MavFtpFS(pyfuse3.Operations):
-    def __init__(self, client: MavFtpClient):
-        self.client = client
+    def __init__(self, client: MavFtpClient, list_crc32_xattr: bool = False):
+        self._client = client
+        self._list_crc32_xattr = list_crc32_xattr
         root_file = File(inode=pyfuse3.ROOT_INODE, path="",
                          parent=None, size=0, type='directory')
         root_file.parent = root_file  # Root directory is its own parent
 
-        self.files_by_inode = {
+        self._files_by_inode = {
             pyfuse3.ROOT_INODE: root_file
         }
-        self.files_by_path = {
-            '': self.files_by_inode[pyfuse3.ROOT_INODE]
+        self._files_by_path = {
+            '': self._files_by_inode[pyfuse3.ROOT_INODE]
         }
-        self.files_by_handle = {}
+        self._files_by_handle = {}
 
-        self.inode_counter = pyfuse3.ROOT_INODE + 1
-        self.fh_counter = 0
+        self._inode_counter = pyfuse3.ROOT_INODE + 1
+        self._fh_counter = 0
 
     async def getattr(self, inode, ctx=None):
         entry = pyfuse3.EntryAttributes()
-        if inode in self.files_by_inode:
-            file = self.files_by_inode[inode]
+        if inode in self._files_by_inode:
+            file = self._files_by_inode[inode]
             entry.st_mode = (stat.S_IFDIR | 0o755) if file.type == 'directory' else (
                 stat.S_IFREG | 0o644)
             entry.st_size = file.size
@@ -63,7 +69,7 @@ class MavFtpFS(pyfuse3.Operations):
 
     async def lookup(self, parent_inode, name, ctx=None):
         name_str = name.decode("utf-8")
-        parent = self.files_by_inode.get(parent_inode, None)
+        parent = self._files_by_inode.get(parent_inode, None)
         if parent is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
         full_path = parent.path + "/" + name_str
@@ -72,84 +78,86 @@ class MavFtpFS(pyfuse3.Operations):
             return await self.getattr(parent_inode)
         elif name_str == '..':
             return await self.getattr(parent.parent.inode)
-        elif full_path not in self.files_by_path:
+        elif full_path not in self._files_by_path:
             # Check directory listing
             await self.mavlink_opendir(parent)
-            if full_path not in self.files_by_path:
+            if full_path not in self._files_by_path:
                 # Still not found, raise ENOENT
                 raise pyfuse3.FUSEError(errno.ENOENT)
 
-        return await self.getattr(self.files_by_path[full_path].inode)
+        return await self.getattr(self._files_by_path[full_path].inode)
 
     async def opendir(self, inode, ctx):
-        if inode not in self.files_by_inode:
+        if inode not in self._files_by_inode:
             raise pyfuse3.FUSEError(errno.ENOENT)
 
-        fh = self.fh_counter
-        self.fh_counter += 1
-        self.files_by_handle[fh] = self.files_by_inode[inode]
+        fh = self._fh_counter
+        self._fh_counter += 1
+        self._files_by_handle[fh] = self._files_by_inode[inode]
         return fh
 
     async def open(self, inode, flags, ctx):
-        if inode not in self.files_by_inode:
+        if inode not in self._files_by_inode:
             raise pyfuse3.FUSEError(errno.ENOENT)
 
         # Is the file already open?
-        for fh, file in self.files_by_handle.items():
+        for fh, file in self._files_by_handle.items():
             if file.inode == inode:
                 return pyfuse3.FileInfo(fh=fh, direct_io=True, keep_cache=False, nonseekable=False)
 
-        if not await self.client.open_file_ro(self.files_by_inode[inode].path):
+        if not await self._client.open_file_ro(self._files_by_inode[inode].path):
             raise pyfuse3.FUSEError(errno.EIO)
 
-        fh = self.fh_counter
-        self.fh_counter += 1
-        self.files_by_handle[fh] = self.files_by_inode[inode]
+        fh = self._fh_counter
+        self._fh_counter += 1
+        self._files_by_handle[fh] = self._files_by_inode[inode]
         return pyfuse3.FileInfo(fh=fh, direct_io=True, keep_cache=False, nonseekable=False)
 
     async def read(self, fh, offset, length):
-        if fh not in self.files_by_handle:
+        if fh not in self._files_by_handle:
             raise pyfuse3.FUSEError(errno.EBADF)
 
-        file = self.files_by_handle[fh]
+        file = self._files_by_handle[fh]
         if file.type == 'directory':
             raise pyfuse3.FUSEError(errno.EISDIR)
 
-        data = await self.client.read_file(file.path, offset, length)
+        data = await self._client.read_file(file.path, offset, length)
         if data is None:
             raise pyfuse3.FUSEError(errno.EIO)
 
         return data
 
     async def release(self, fh) -> None:
-        if fh in self.files_by_handle:
-            await self.client.close_session(self.files_by_handle[fh].path)
+        if fh in self._files_by_handle:
+            await self._client.close_session(self._files_by_handle[fh].path)
             try:
-                del self.files_by_handle[fh]
+                del self._files_by_handle[fh]
             except KeyError:
                 print(f"Warn: Tried to remove non-existent file handle {fh}")
         else:
             raise pyfuse3.FUSEError(errno.EBADF)
 
     async def releasedir(self, fh):
-        if fh in self.files_by_handle:
-            del self.files_by_handle[fh]
+        if fh in self._files_by_handle:
+            del self._files_by_handle[fh]
         else:
             raise pyfuse3.FUSEError(errno.EBADF)
 
     async def mavlink_opendir(self, dir: File):
         files = []
-        mavlink_entries = await self.client.list_directory(dir.path)
+        mavlink_entries = await self._client.list_directory(dir.path)
+        if mavlink_entries is None:
+            raise pyfuse3.FUSEError(errno.EIO)
         for entry in mavlink_entries:
             if entry['type'] == 'skip':
                 continue
             # Check if the file already exists, then we can reuse the inode
-            existing_file = self.files_by_path.get(
+            existing_file = self._files_by_path.get(
                 dir.path + "/" + entry['name'], None)
             if existing_file is None:
                 # If not, create a new inode
-                inode = self.inode_counter
-                self.inode_counter += 1
+                inode = self._inode_counter
+                self._inode_counter += 1
             else:
                 inode = existing_file.inode
 
@@ -160,15 +168,15 @@ class MavFtpFS(pyfuse3.Operations):
                 size=entry.get('size', 0),
                 type=entry['type']
             )
-            self.files_by_inode[f.inode] = f
-            self.files_by_path[f.path] = f
+            self._files_by_inode[f.inode] = f
+            self._files_by_path[f.path] = f
 
             files.append((entry['name'], f))
 
         return files
 
     async def readdir(self, fh, start_id, token):
-        dir = self.files_by_handle.get(fh, None)
+        dir = self._files_by_handle.get(fh, None)
         if dir is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
 
@@ -184,6 +192,49 @@ class MavFtpFS(pyfuse3.Operations):
                 break
             start_id += 1
 
+    async def rmdir(self, parent_inode, name, ctx):
+        name_str = name.decode("utf-8")
+        parent = self._files_by_inode.get(parent_inode, None)
+        if parent is None:
+            raise pyfuse3.FUSEError(errno.ENOENT)
+        full_path = parent.path + "/" + name_str
+
+        await self.lookup(parent_inode, name_str)
+
+        file = self._files_by_path.get(full_path, None)
+        if file.type != 'directory':
+            raise pyfuse3.FUSEError(errno.ENOTDIR)
+
+        await self._client.delete_file(file.path)
+        del self._files_by_path[full_path]
+        del self._files_by_inode[file.inode]
+
+    async def getxattr(self, inode, name, ctx):
+        name_str = name.decode("utf-8")
+        file = self._files_by_inode.get(inode, None)
+        if file is None or file.type != 'file':
+            raise pyfuse3.FUSEError(errno.ENOENT)
+
+        if name_str != "user.mavlink.crc32":
+            raise pyfuse3.FUSEError(pyfuse3.ENOATTR)
+
+        crc = await self._client.crc32(self._files_by_inode[inode].path)
+        return struct.pack("<I", crc)
+
+    async def listxattr(self, inode, ctx):
+        file = self._files_by_inode.get(inode, None)
+        if file is None:
+            raise pyfuse3.FUSEError(errno.ENOENT)
+        if file.type != 'file':
+            return []
+        if self._list_crc32_xattr:
+            return [b"user.mavlink.crc32"]
+        # By default, hide the crc32 xattr from the user when listing
+        # It is computationally for the fc to calculate
+        # And we want to prevent programs from requesting it by default
+        # since it is often not needed.
+        return []
+
 shutdown_event = asyncio.Event()
 
 def sigint_handler():
@@ -194,7 +245,7 @@ def sigint_handler():
     shutdown_event.set()
 
 
-async def main(connection_str: str, mountpoint: str, write_mode: bool = False):
+async def main(connection_str: str, mountpoint: str, write_mode: bool = False, debug: bool = False, list_crc32_xattr: bool = False):
     asyncio.get_event_loop().add_signal_handler(
         signal.SIGINT,
         sigint_handler)
@@ -207,20 +258,24 @@ async def main(connection_str: str, mountpoint: str, write_mode: bool = False):
 
     # Mount the filesystem
     fuse_options = set(pyfuse3.default_options)
-    fuse_options.add('debug')
+    if debug:
+        fuse_options.add('debug')
     fuse_options.add('auto_unmount')
-    fuse_options.add('ro')
     fuse_options.add('sync')
     fuse_options.add('dirsync')
     fuse_options.add('noatime')
-    pyfuse3.init(MavFtpFS(client), mountpoint, fuse_options)
+    if write_mode:
+        fuse_options.add('rw')
+    else:
+        fuse_options.add('ro')
+    pyfuse3.init(MavFtpFS(client, list_crc32_xattr), mountpoint, fuse_options)
     asyncio.create_task(pyfuse3.main())
 
-    # Wait for sigint
-    await shutdown_event.wait()
-
-    pyfuse3.close()
-    await client.close()
+    try:
+        await shutdown_event.wait()
+    finally:
+        await client.close()
+        pyfuse3.close()
 
 
 if __name__ == '__main__':
@@ -232,6 +287,10 @@ if __name__ == '__main__':
                         help='Mountpoint path (e.g., /mnt/mavlink)')
     parser.add_argument('-w', '--write', action='store_true',
                         help='Enable write mode (optional, default is read-only).')
+    parser.add_argument('-d', '--debug', action='store_true',
+                        help='Enable debug mode (optional).')
+    parser.add_argument('--list_crc32_xattr', action='store_true',
+                        help="By default, the CRC32 xattr is hidden when listing xattrs, since the value is computationally expensive for the fc to calculate. This flag will show it in the xattr list.")
 
     args = parser.parse_args()
-    asyncio.run(main(args.connection_string, args.mountpoint, args.write))
+    asyncio.run(main(args.connection_string, args.mountpoint, args.write, args.debug, args.list_crc32_xattr))

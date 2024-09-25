@@ -1,11 +1,12 @@
 import asyncio
-from enum import Enum
 import struct
 from dataclasses import dataclass
+from enum import Enum
+from typing import Optional
 
 from pymavlink import mavutil
+
 from received_burst_data import ReceivedBurstData
-from typing import Optional
 
 
 class MavFtpOpcode(Enum):
@@ -15,7 +16,10 @@ class MavFtpOpcode(Enum):
     OPEN_FILE_RO = 4
     CREATE_FILE = 6
     WRITE_FILE = 7
+    CREATE_DIRECTORY = 9
+    REMOVE_DIRECTORY = 10
     OPEN_FILE_WO = 11
+    CALC_FILE_CRC32 = 14
     BURST_READ_FILE = 15
     ACK = 128
     NAK = 129
@@ -85,7 +89,7 @@ class MavFtpPayload:
             fixed_part = struct.pack(
                 self.STRUCT_FORMAT,
                 self.seq_number,
-                self.session,
+                self.session if self.session is not None else 0,
                 opcode_val,
                 self.size,
                 req_opcode_val,
@@ -95,6 +99,7 @@ class MavFtpPayload:
             )
         except:
             print(f"Error {self}")
+            raise Exception(f"Error {self}")
         data = self.data.ljust(self.MAV_FTP_MAX_DATA_LEN, b'\0')
         payload = fixed_part + data
         return payload
@@ -316,13 +321,14 @@ class MavFtpClient:
             if decoded_response.opcode != MavFtpOpcode.ACK:
                 if decoded_response.opcode == MavFtpOpcode.NAK:
                     error_code = self._parse_nak(decoded_response.data)
-                    print(f"Error: {error_code.name}")
+                    print(f"CLOSING SESS Error: {error_code.name}")
                     return
                 print("Error: Unexpected response. Expected opcode ACK.")
                 return
-            print(f"Closed session {self._session}")
+            
             self._session = None
-            self.session_id = None
+            self._session_path = None
+            self._session_type = None
 
     async def open_file_ro(self, path) -> bool:
         async with self._ftp_lock:
@@ -383,8 +389,16 @@ class MavFtpClient:
             return await self._read_file(path, offset, size)
 
     async def _read_file(self, path, offset, size) -> Optional[bytearray]:
-        # Need to open the file first, if not already open
-        if self._session_path != path or self._session_type != MavFtpOpcode.OPEN_FILE_RO:
+
+        # TODO: PX4 seems to send up to 180 packets in a burst (~42 kB)
+        # We can't really stop it early, so if we only need a few bytes, we should
+        # use regular read_file instead of burst_read_file for better performance
+        # At least we should do some caching of the last burst read file to avoid
+        # a new large burst read file if we only need a few bytes
+        #
+        # Or maybe just find a way to stop the burst read early
+
+        if self._session is None or self._session_path != path or self._session_type != MavFtpOpcode.OPEN_FILE_RO:
             if not await self._open_file_ro(path):
                 return None
         received_data = ReceivedBurstData(offset, size)
@@ -398,7 +412,7 @@ class MavFtpClient:
                 seq_number=self._create_seq_number(),
                 opcode=MavFtpOpcode.BURST_READ_FILE,
                 offset=next_missing[0],
-                size=min(next_missing[1], MavFtpPayload.MAV_FTP_MAX_DATA_LEN),
+                size=MavFtpPayload.MAV_FTP_MAX_DATA_LEN,
             )
             self._conn.mav.file_transfer_protocol_send(
                 target_network=0,
@@ -432,4 +446,49 @@ class MavFtpClient:
                     print("Error: Unexpected response. Expected opcode ACK or NAK.")
                     return None
         data = received_data.get_data()
+        if len(data) > size: # Can get too much if burst goes over the requested size
+            return data[:size]
+        await self._close_session()
         return data
+    
+    async def crc32(self, path):
+        async with self._ftp_lock:
+            await self._clear_ftp_queue()
+            return await self._crc32(path)
+
+    async def _crc32(self, path):
+        # Ask the vehicle to calculate the CRC32 of the file
+        path_bytes = path.encode('utf-8')
+        payload = MavFtpPayload(
+            seq_number=self._create_seq_number(),
+            opcode=MavFtpOpcode.CALC_FILE_CRC32,
+            size=len(path_bytes),
+            data=path_bytes
+        )
+
+        self._conn.mav.file_transfer_protocol_send(
+            target_network=0,
+            target_system=self._conn.target_system,
+            target_component=self._conn.target_component,
+            payload=payload.encode()
+        )
+
+        try:
+            response = await asyncio.wait_for(self._ftp_q.get(), timeout=1000)
+        except asyncio.TimeoutError:
+            print("Timed out waiting for CRC32 response.")
+            return None
+        
+        if response.req_opcode != MavFtpOpcode.CALC_FILE_CRC32:
+            print("Error: Unexpected response. Expected req_opcode CALC_FILE_CRC32.")
+            return None
+        
+        if response.opcode == MavFtpOpcode.ACK:
+            return struct.unpack('<I', response.data)[0]
+        elif response.opcode == MavFtpOpcode.NAK:
+            error_code = self._parse_nak(response.data)
+            print(f"Error: {error_code.name}")
+            return None
+        else:
+            print("Error: Unexpected response. Expected opcode ACK or NAK.")
+            return None
