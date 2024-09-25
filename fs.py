@@ -14,7 +14,6 @@ import pyfuse3
 import pyfuse3.asyncio
 
 from mavftp import MavFtpClient
-from ulog_parse import parse_ulog
 
 pyfuse3.asyncio.enable()
 
