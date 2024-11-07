@@ -2,7 +2,7 @@ import asyncio
 import struct
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
+from typing import Optional, Dict
 
 from pymavlink import mavutil
 
@@ -105,6 +105,17 @@ class MavFtpPayload:
         return payload
 
 
+@dataclass
+class MavFtpMessage:
+    payload: MavFtpPayload
+    target_network: int = 0
+    target_system: int = 0
+    target_component: int = 0
+
+    timeout_s: float = 1.0
+    max_retries: int = 3
+
+
 class MavFtpClient:
     def __init__(self):
         self._shutdown_event = asyncio.Event()
@@ -112,40 +123,52 @@ class MavFtpClient:
 
         self._ftp_lock = asyncio.Lock()
         self._ftp_q = asyncio.Queue()
+        self._ftp_burst_q = asyncio.Queue()
         self._heartbeat_q = asyncio.Queue()
 
         self._session: Optional[int] = None
         self._session_path: Optional[str] = None
         self._session_type: Optional[MavFtpOpcode] = None
 
+        self._ftp_out_q = asyncio.Queue()
+        self._awaiting_ack: Dict[int, asyncio.Future] = {}
+
         self.seq_num: int = 1
+
+    async def _send_message_with_ack(self, msg: MavFtpMessage) -> MavFtpPayload:
+        expected_req_opcode = msg.payload.opcode
+        for attempt in range(msg.max_retries):
+            if attempt > 0:
+                print(f"Retrying message {msg}, attempt {attempt + 1}/{msg.max_retries}")
+            msg.payload.seq_number = self._create_seq_number()
+            response_seq_number = msg.payload.seq_number + 1 % 65536
+            self._awaiting_ack[response_seq_number] = asyncio.Future()
+            self._conn.mav.file_transfer_protocol_send(
+                target_network=msg.target_network,
+                target_system=msg.target_system,
+                target_component=msg.target_component,
+                payload=msg.payload.encode()
+            )
+
+            try:
+                response = await asyncio.wait_for(self._awaiting_ack[response_seq_number], timeout=msg.timeout_s)
+                if response.req_opcode != expected_req_opcode:
+                    print(f"Received unexpected req_opcode {response.req_opcode}. Expected {expected_req_opcode}")
+                    continue
+                self._awaiting_ack.pop(response_seq_number)
+                return response
+            except asyncio.TimeoutError:
+                self._awaiting_ack.pop(response_seq_number).cancel()
+                continue
+
+        raise Exception(f"Failed to send message {msg}")
 
     def _create_seq_number(self) -> int:
         self.seq_num = (self.seq_num + 1) % 65536
         return self.seq_num
 
-    def _receive_seq_number(self, payload) -> bool:
-        diff = (payload.seq_number - self.seq_num) % 65536
-        if diff == 0:
-            # Duplicate packet
-            print(f"Warn: Received duplicate packet with seq number {payload.seq_number}")
-            return False
-        elif diff == 1:
-            # Expected sequence number
-            self.seq_num = (payload.seq_number) % 65536
-            return True
-        elif diff < 10:
-            # We assume lost packets, accept the new seq number
-            print(f"Warn: Received out-of-order packet. Expected {self.seq_num}, got {payload.seq_number}")
-            self.seq_num = (payload.seq_number % 65536)
-            return True
-        else:
-            # Wrong sequence number, possibly old packet. Drop it.
-            print(f"Warn: Dropping packet with seq number {payload.seq_number}, expected {self.seq_num}")
-            return False
-
     async def connect(self, connection_string) -> None:
-        self._conn = mavutil.mavlink_connection(connection_string, baud=57600)
+        self._conn = mavutil.mavlink_connection(connection_string)
         self.heartbeats_task = asyncio.create_task(self._send_heartbeats())
         self.receive_task = asyncio.create_task(self._receive_loop())
 
@@ -186,8 +209,13 @@ class MavFtpClient:
                 if msg.get_type() == 'FILE_TRANSFER_PROTOCOL':
                     try:
                         payload = MavFtpPayload.from_bytes(bytes(msg.payload))
-                        if self._receive_seq_number(payload):
-                            self._ftp_q.put_nowait(payload)
+                        if payload.req_opcode == MavFtpOpcode.BURST_READ_FILE:
+                            self._ftp_burst_q.put_nowait(payload)
+                        else:
+                            if self._awaiting_ack.get(payload.seq_number):
+                                self._awaiting_ack[payload.seq_number].set_result(payload)
+                            else:
+                                print(f"Received unexpected sequence number {payload.seq_number}")
                     except asyncio.QueueFull:
                         pass
                 elif msg.get_type() == 'HEARTBEAT':
@@ -248,27 +276,19 @@ class MavFtpClient:
 
         while True:
             path_bytes = remote_path.encode('utf-8')
-            payload = MavFtpPayload(seq_number=self._create_seq_number(), opcode=MavFtpOpcode.LIST_DIRECTORY.value, size=len(
+            payload = MavFtpPayload(seq_number=self._create_seq_number(), opcode=MavFtpOpcode.LIST_DIRECTORY, size=len(
                 path_bytes), offset=offset, data=path_bytes)
-            self._conn.mav.file_transfer_protocol_send(
-                target_network=0,
-                target_system=self._conn.target_system,
-                target_component=self._conn.target_component,
-                payload=payload.encode()
-            )
+
             try:
-                decoded_response = await asyncio.wait_for(self._ftp_q.get(), timeout=1)
-            except asyncio.TimeoutError:
-                print("Timed out waiting for directory list response.")
+                response = await self._send_message_with_ack(MavFtpMessage(payload=payload))
+
+            except asyncio.CancelledError:
+                print("Error: Did not receive response for LIST_DIRECTORY request.")
                 return
 
-            if decoded_response.req_opcode != MavFtpOpcode.LIST_DIRECTORY:
-                print(f"Error: Unexpected response {decoded_response}. Expected req_opcode LIST_DIRECTORY.")
-                return
-
-            if decoded_response.opcode != MavFtpOpcode.ACK:
-                if decoded_response.opcode == MavFtpOpcode.NAK:
-                    error_code = self._parse_nak(decoded_response.data)
+            if response.opcode != MavFtpOpcode.ACK:
+                if response.opcode == MavFtpOpcode.NAK:
+                    error_code = self._parse_nak(response.data)
 
                     if error_code == MavFtpError.EOF:
                         # Directory listings are always terminated with an EOF
@@ -280,8 +300,7 @@ class MavFtpClient:
                     print("Error: Unexpected response. Expected opcode ACK or NAK.")
                     return
 
-            files.extend(self._decode_directory_listing(
-                decoded_response.data))
+            files.extend(self._decode_directory_listing(response.data))
             offset = max(len(files), 1)
 
         return files
@@ -301,26 +320,17 @@ class MavFtpClient:
                 seq_number=self._create_seq_number(),
                 opcode=MavFtpOpcode.TERMINATE_SESSION
             )
-            self._conn.mav.file_transfer_protocol_send(
-                target_network=0,
-                target_system=self._conn.target_system,
-                target_component=self._conn.target_component,
-                payload=payload.encode()
-            )
 
             try:
-                decoded_response = await asyncio.wait_for(self._ftp_q.get(), timeout=1)
-            except asyncio.TimeoutError:
-                print("Timed out waiting for TERMINATE_SESSION response.")
+                response = await self._send_message_with_ack(MavFtpMessage(payload=payload))
+            except asyncio.CancelledError:
+                print("Error: Did not receive response for TERMINATE_SESSION request.")
                 return
 
-            if decoded_response.req_opcode != MavFtpOpcode.TERMINATE_SESSION:
-                print("Error: Unexpected response. Expected req_opcode TERMINATE_SESSION.")
-                return
 
-            if decoded_response.opcode != MavFtpOpcode.ACK:
-                if decoded_response.opcode == MavFtpOpcode.NAK:
-                    error_code = self._parse_nak(decoded_response.data)
+            if response.opcode != MavFtpOpcode.ACK:
+                if response.opcode == MavFtpOpcode.NAK:
+                    error_code = self._parse_nak(response.data)
                     print(f"CLOSING SESS Error: {error_code.name}")
                     return
                 print("Error: Unexpected response. Expected opcode ACK.")
@@ -352,21 +362,10 @@ class MavFtpClient:
             data=path_bytes,
         )
 
-        self._conn.mav.file_transfer_protocol_send(
-            target_network=0,
-            target_system=self._conn.target_system,
-            target_component=self._conn.target_component,
-            payload=payload.encode()
-        )
-
         try:
-            response = await asyncio.wait_for(self._ftp_q.get(), timeout=1)
-        except asyncio.TimeoutError:
-            print("Timed out waiting for response.")
-            return False
-
-        if response.req_opcode != MavFtpOpcode.OPEN_FILE_RO:
-            print("Error: Unexpected response. Expected req_opcode OPEN_FILE_RO.")
+            response = await self._send_message_with_ack(MavFtpMessage(payload=payload))
+        except asyncio.CancelledError:
+            print("Error: Did not receive response for OPEN_FILE_RO request.")
             return False
 
         if response.opcode != MavFtpOpcode.ACK:
@@ -423,14 +422,11 @@ class MavFtpClient:
 
             while True:
                 try:
-                    decoded_response = await asyncio.wait_for(self._ftp_q.get(), timeout=1)
+                    decoded_response = await asyncio.wait_for(self._ftp_burst_q.get(), timeout=1)
                 except asyncio.TimeoutError:
-                    print("Timed out waiting for burst to complete.")
-                    return None
+                    print("Timeout waiting for burst data.")
+                    break
 
-                if not decoded_response.req_opcode == MavFtpOpcode.BURST_READ_FILE:
-                    print("Error: Unexpected response. Expected req_opcode BURST_READ_FILE.")
-                    return None
                 if decoded_response.opcode == MavFtpOpcode.ACK:
                     received_data.mark_completed(decoded_response.offset, decoded_response.size, decoded_response.data)
                     if decoded_response.burst_complete:
@@ -466,23 +462,12 @@ class MavFtpClient:
             data=path_bytes
         )
 
-        self._conn.mav.file_transfer_protocol_send(
-            target_network=0,
-            target_system=self._conn.target_system,
-            target_component=self._conn.target_component,
-            payload=payload.encode()
-        )
-
         try:
-            response = await asyncio.wait_for(self._ftp_q.get(), timeout=1000)
-        except asyncio.TimeoutError:
-            print("Timed out waiting for CRC32 response.")
+            response = await self._send_message_with_ack(MavFtpMessage(payload=payload, timeout_s=30))
+        except asyncio.CancelledError:
+            print("Error: Did not receive response for CALC_FILE_CRC32 request.")
             return None
-        
-        if response.req_opcode != MavFtpOpcode.CALC_FILE_CRC32:
-            print("Error: Unexpected response. Expected req_opcode CALC_FILE_CRC32.")
-            return None
-        
+
         if response.opcode == MavFtpOpcode.ACK:
             return struct.unpack('<I', response.data)[0]
         elif response.opcode == MavFtpOpcode.NAK:

@@ -6,7 +6,6 @@ import os
 import signal
 import stat
 import time
-import threading
 import struct
 from dataclasses import dataclass
 
@@ -186,7 +185,7 @@ class MavFtpFS(pyfuse3.Operations):
         dir_files.extend(await self.mavlink_opendir(dir))
         # Iterate, starting at the requested ID
         for f in dir_files[start_id:]:
-            res = pyfuse3.readdir_reply(token, f[0].encode("utf-8"), await self.getattr(f[1].inode), start_id+1)
+            res = pyfuse3.readdir_reply(token, f[0].encode("utf-8"), await self.getattr(f[1].inode), start_id + 1)
             if not res:
                 break
             start_id += 1
@@ -234,7 +233,9 @@ class MavFtpFS(pyfuse3.Operations):
         # since it is often not needed.
         return []
 
+
 shutdown_event = asyncio.Event()
+
 
 def sigint_handler():
     if shutdown_event.is_set():
