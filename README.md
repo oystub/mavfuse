@@ -18,4 +18,4 @@ Supports basic file operations like read, write, open, close, etc.
 - `--list_crc32_xattr` unless specified, the `user.mavlink.crc32` xattr is hidden unless directly requested. This is because the checksum is computationally expensive for the FCU to calculate, and is not always needed.
 *(NB! MAVFTP uses a non-standard CRC32 algorithm. See `crc32.py`)*
 
-E.g. `python3 -m mavfuse tcp:129.0.0.1:14550 ~/mnt/mav`
+E.g. `python3 -m mavfuse tcp:127.0.0.1:14550 ~/mnt/mav`
