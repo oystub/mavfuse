@@ -100,6 +100,13 @@ class MavFtpFS(pyfuse3.Operations):
         if inode not in self._files_by_inode:
             raise pyfuse3.FUSEError(errno.ENOENT)
 
+
+        # Check for O_TRUNC flag and write mode
+        if flags & os.O_TRUNC and (flags & os.O_WRONLY or flags & os.O_RDWR):
+            # Truncate the file to 0 bytes
+            if not await self._client.truncate_file(self._files_by_inode[inode].path, 0):
+                raise pyfuse3.FUSEError(errno.EIO)
+
         # Is the file already open?
         for fh, file in self._files_by_handle.items():
             if file.inode == inode:

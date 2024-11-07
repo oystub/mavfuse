@@ -656,6 +656,14 @@ class MavFtpClient:
             return await self._truncate_file(path, size)
 
     async def _truncate_file(self, path, size):
+        await self._close_session()
+
+        if size == 0:
+            # MAVFTP spec doesn't support truncating to 0.
+            # Luckily, truncate to 0 is the same as removing the file and creating a new one
+            await self._remove_file(path)
+            return await self._create_file(path)
+
         path_bytes = path.encode('ascii')
         payload = MavFtpPayload(
             opcode=MavFtpOpcode.TRUNCATE_FILE,
@@ -672,7 +680,7 @@ class MavFtpClient:
             return True
         else:
             error_code = self._parse_nak(response.data)
-            self._logger.log(f"Unexpected error while truncating file \"{path}\": {error_code.name}")
+            self._logger.error(f"Unexpected error while truncating file \"{path}\": {error_code.name}")
             return False
 
     async def crc32(self, path):
