@@ -139,7 +139,7 @@ class MavFtpClient:
 
         self.seq_num: int = 1
 
-    async def _send_message_with_ack(self, msg: MavFtpMessage) -> MavFtpPayload:
+    async def _send_message(self, msg: MavFtpMessage, await_ack=True) -> MavFtpPayload:
         expected_req_opcode = msg.payload.opcode
         for attempt in range(msg.max_retries):
             # Exponential backoff
@@ -155,7 +155,8 @@ class MavFtpClient:
                 target_component=msg.target_component,
                 payload=msg.payload.encode()
             )
-
+            if not await_ack:
+                return None
             try:
                 response = await asyncio.wait_for(self._awaiting_ack[response_seq_number], timeout=timeout)
                 self._awaiting_ack.pop(response_seq_number)
@@ -293,7 +294,7 @@ class MavFtpClient:
                 data=path_bytes)
 
             try:
-                response = await self._send_message_with_ack(MavFtpMessage(payload=payload))
+                response = await self._send_message(MavFtpMessage(payload=payload))
 
             except asyncio.CancelledError:
                 self._logger.error("Did not receive response for LIST_DIRECTORY request.")
@@ -329,16 +330,15 @@ class MavFtpClient:
                 opcode=MavFtpOpcode.TERMINATE_SESSION
             )
 
+            # Terminate Session is a special case, as it doesn't have an ack response
+
+            # First one actually closes the session
+            await self._send_message(MavFtpMessage(payload=payload), await_ack=False)
+            # Retry until we get a NAK for the first retry when the session is already closed
             try:
-                response = await self._send_message_with_ack(MavFtpMessage(payload=payload))
+                response = await self._send_message(MavFtpMessage(payload=payload), await_ack=True)
             except asyncio.CancelledError:
                 self._logger.error("Did not receive response for TERMINATE_SESSION request.")
-                return
-
-            if response.opcode == MavFtpOpcode.NAK:
-                error_code = self._parse_nak(response.data)
-                self._logger.error(f"Unknown error while closing session: {error_code.name}")
-                return
 
             self._session = None
             self._session_path = None
@@ -366,7 +366,7 @@ class MavFtpClient:
         )
 
         try:
-            response = await self._send_message_with_ack(MavFtpMessage(payload=payload))
+            response = await self._send_message(MavFtpMessage(payload=payload))
         except asyncio.CancelledError:
             return False
 
@@ -398,7 +398,7 @@ class MavFtpClient:
         )
 
         try:
-            response = await self._send_message_with_ack(MavFtpMessage(payload=payload))
+            response = await self._send_message(MavFtpMessage(payload=payload))
         except asyncio.CancelledError:
             return False
 
@@ -495,7 +495,7 @@ class MavFtpClient:
         )
 
         try:
-            response = await self._send_message_with_ack(MavFtpMessage(payload=payload))
+            response = await self._send_message(MavFtpMessage(payload=payload))
         except asyncio.CancelledError:
             return False
 
@@ -524,7 +524,7 @@ class MavFtpClient:
         )
 
         try:
-            response = await self._send_message_with_ack(MavFtpMessage(payload=payload))
+            response = await self._send_message(MavFtpMessage(payload=payload))
         except asyncio.CancelledError:
             return False
 
@@ -549,7 +549,7 @@ class MavFtpClient:
         )
 
         try:
-            response = await self._send_message_with_ack(MavFtpMessage(payload=payload))
+            response = await self._send_message(MavFtpMessage(payload=payload))
         except asyncio.CancelledError:
             return False
 
@@ -574,7 +574,7 @@ class MavFtpClient:
         )
 
         try:
-            response = await self._send_message_with_ack(MavFtpMessage(payload=payload))
+            response = await self._send_message(MavFtpMessage(payload=payload))
         except asyncio.CancelledError:
             return False
 
@@ -609,7 +609,7 @@ class MavFtpClient:
             if retries > 0:
                 self._logger.info(f"Retrying write {retries + 1}/{max_retries}")
             try:
-                response = await self._send_message_with_ack(MavFtpMessage(payload=payload, max_retries=1))
+                response = await self._send_message(MavFtpMessage(payload=payload, max_retries=1))
             except asyncio.CancelledError:
                 return False
             if response.opcode == MavFtpOpcode.ACK:
@@ -639,7 +639,7 @@ class MavFtpClient:
         )
 
         try:
-            response = await self._send_message_with_ack(MavFtpMessage(payload=payload))
+            response = await self._send_message(MavFtpMessage(payload=payload))
         except asyncio.CancelledError:
             return False
 
@@ -664,7 +664,7 @@ class MavFtpClient:
         )
 
         try:
-            response = await self._send_message_with_ack(MavFtpMessage(payload=payload))
+            response = await self._send_message(MavFtpMessage(payload=payload))
         except asyncio.CancelledError:
             return False
 
@@ -690,7 +690,7 @@ class MavFtpClient:
         )
 
         try:
-            response = await self._send_message_with_ack(MavFtpMessage(payload=payload, timeout_s=30))
+            response = await self._send_message(MavFtpMessage(payload=payload, timeout_s=30))
         except asyncio.CancelledError:
             return None
 
