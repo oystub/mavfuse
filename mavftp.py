@@ -114,6 +114,7 @@ class MavFtpMessage:
     target_component: int = 0
 
     timeout_s: float = 0.2
+    max_timeout_s: float = 5
     max_retries: int = 6
 
 
@@ -141,6 +142,8 @@ class MavFtpClient:
     async def _send_message_with_ack(self, msg: MavFtpMessage) -> MavFtpPayload:
         expected_req_opcode = msg.payload.opcode
         for attempt in range(msg.max_retries):
+            # Exponential backoff
+            timeout = min(msg.max_timeout_s * 2**attempt, 3)
             if attempt > 0:
                 self._logger.info(f"Retransmitting {msg.payload.opcode.name}, attempt {attempt + 1}/{msg.max_retries}")
             msg.payload.seq_number = self._create_seq_number()
@@ -154,7 +157,7 @@ class MavFtpClient:
             )
 
             try:
-                response = await asyncio.wait_for(self._awaiting_ack[response_seq_number], timeout=msg.timeout_s)
+                response = await asyncio.wait_for(self._awaiting_ack[response_seq_number], timeout=timeout)
                 self._awaiting_ack.pop(response_seq_number)
                 if response.req_opcode != expected_req_opcode:
                     self._logger.error(f"Received unexpected req_opcode {response.req_opcode}. Expected {expected_req_opcode}")
