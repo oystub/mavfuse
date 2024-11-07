@@ -43,11 +43,11 @@ class ReceivedBurstData:
         if data:
             if len(self._data) < end:
                 self._data.extend(bytearray(end - len(self._data)))
-            self._data[start-self._initial_offset:end-self._initial_offset] = data
+            self._data[start - self._initial_offset:end - self._initial_offset] = data
 
     def eof(self, offset):
-        self.mark_completed(offset, self._total_size-(offset-self._initial_offset))
-        self._total_size = offset-self._initial_offset
+        self.mark_completed(offset, self._total_size - (offset - self._initial_offset))
+        self._total_size = offset - self._initial_offset
 
     def get_missing(self):
         return [(start, size) for start, size in self.missing_ranges.items()]

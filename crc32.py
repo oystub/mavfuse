@@ -1,5 +1,6 @@
 import zlib
 
+
 def compute_file_crc32(file):
     # Note that the MAVLink CRC32 checksum is different from the zlib CRC32 checksum.
     # https://mavlink.io/en/guide/crc.html
@@ -16,6 +17,7 @@ def compute_file_crc32(file):
 
     # Ensure checksum is in unsigned 32-bit format
     return checksum ^ 0xFFFFFFFF
+
 
 if __name__ == "__main__":
     # Get filename from argv
