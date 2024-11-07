@@ -3,6 +3,7 @@ import struct
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional, Dict
+import logging
 
 from pymavlink import mavutil
 
@@ -14,11 +15,15 @@ class MavFtpOpcode(Enum):
     TERMINATE_SESSION = 1
     LIST_DIRECTORY = 3
     OPEN_FILE_RO = 4
+    READ_FILE = 5
     CREATE_FILE = 6
     WRITE_FILE = 7
+    REMOVE_FILE = 8
     CREATE_DIRECTORY = 9
     REMOVE_DIRECTORY = 10
     OPEN_FILE_WO = 11
+    TRUNCATE_FILE = 12
+    RENAME = 13
     CALC_FILE_CRC32 = 14
     BURST_READ_FILE = 15
     ACK = 128
@@ -85,21 +90,17 @@ class MavFtpPayload:
             req_opcode_val = self.req_opcode.value
         else:
             req_opcode_val = self.req_opcode
-        try:
-            fixed_part = struct.pack(
-                self.STRUCT_FORMAT,
-                self.seq_number,
-                self.session if self.session is not None else 0,
-                opcode_val,
-                self.size,
-                req_opcode_val,
-                self.burst_complete,
-                self.padding,
-                self.offset,
-            )
-        except:
-            print(f"Error {self}")
-            raise Exception(f"Error {self}")
+        fixed_part = struct.pack(
+            self.STRUCT_FORMAT,
+            self.seq_number,
+            self.session if self.session is not None else 0,
+            opcode_val,
+            self.size,
+            req_opcode_val,
+            self.burst_complete,
+            self.padding,
+            self.offset,
+        )
         data = self.data.ljust(self.MAV_FTP_MAX_DATA_LEN, b'\0')
         payload = fixed_part + data
         return payload
@@ -112,12 +113,14 @@ class MavFtpMessage:
     target_system: int = 0
     target_component: int = 0
 
-    timeout_s: float = 1.0
-    max_retries: int = 3
+    timeout_s: float = 0.2
+    max_retries: int = 6
 
 
 class MavFtpClient:
     def __init__(self):
+        self._logger = logging.getLogger(__name__)
+
         self._shutdown_event = asyncio.Event()
         self._conn: Optional[mavutil.mavfile] = None
 
@@ -139,7 +142,7 @@ class MavFtpClient:
         expected_req_opcode = msg.payload.opcode
         for attempt in range(msg.max_retries):
             if attempt > 0:
-                print(f"Retrying message {msg}, attempt {attempt + 1}/{msg.max_retries}")
+                self._logger.info(f"Retransmitting {msg.payload.opcode.name}, attempt {attempt + 1}/{msg.max_retries}")
             msg.payload.seq_number = self._create_seq_number()
             response_seq_number = msg.payload.seq_number + 1 % 65536
             self._awaiting_ack[response_seq_number] = asyncio.Future()
@@ -152,16 +155,21 @@ class MavFtpClient:
 
             try:
                 response = await asyncio.wait_for(self._awaiting_ack[response_seq_number], timeout=msg.timeout_s)
-                if response.req_opcode != expected_req_opcode:
-                    print(f"Received unexpected req_opcode {response.req_opcode}. Expected {expected_req_opcode}")
-                    continue
                 self._awaiting_ack.pop(response_seq_number)
+                if response.req_opcode != expected_req_opcode:
+                    self._logger.error(f"Received unexpected req_opcode {response.req_opcode}. Expected {expected_req_opcode}")
+                    continue
+                if response.opcode not in [MavFtpOpcode.ACK, MavFtpOpcode.NAK]:
+                    self._logger.error(f"Received unexpected opcode {response.opcode}. Expected ACK or NAK")
+                    continue
                 return response
             except asyncio.TimeoutError:
+                self._logger.error(f"Timeout while waiting for response to {msg.payload.opcode.name}")
                 self._awaiting_ack.pop(response_seq_number).cancel()
                 continue
 
-        raise Exception(f"Failed to send message {msg}")
+        self._awaiting_ack.pop(response_seq_number).cancel()
+        raise asyncio.CancelledError(f"Did not receive valid response for {msg.payload.opcode.name}")
 
     def _create_seq_number(self) -> int:
         self.seq_num = (self.seq_num + 1) % 65536
@@ -173,9 +181,9 @@ class MavFtpClient:
         self.receive_task = asyncio.create_task(self._receive_loop())
 
         # Wait for the first heartbeat response
-        print("Waiting for heartbeat...")
+        self._logger.info(f"Connecting to {connection_string}, awaiting heartbeat...")
         await self._heartbeat_q.get()
-        print(f"Connected to {connection_string}")
+        self._logger.info(f"Connected to {connection_string}")
 
     async def close(self):
         async with self._ftp_lock:
@@ -215,7 +223,7 @@ class MavFtpClient:
                             if self._awaiting_ack.get(payload.seq_number):
                                 self._awaiting_ack[payload.seq_number].set_result(payload)
                             else:
-                                print(f"Received unexpected sequence number {payload.seq_number}")
+                                self._logger.error(f"Received unexpected sequence number {payload.seq_number}")
                     except asyncio.QueueFull:
                         pass
                 elif msg.get_type() == 'HEARTBEAT':
@@ -245,19 +253,18 @@ class MavFtpClient:
 
     @staticmethod
     def _decode_directory_listing(data):
-        """Decode the directory listing from the data."""
         entries = data.split(b'\0')
         parsed_entries = []
         for entry in entries:
             if entry:
                 if entry[0:1] == b'D':
-                    entry_name = entry[1:].decode('utf-8', errors='ignore')
+                    entry_name = entry[1:].decode('ascii', errors='ignore')
                     parsed_entries.append(
                         {"type": "directory", "name": entry_name})
                 elif entry[0:1] == b'F':
                     parts = entry[1:].split(b'\t')
                     if len(parts) == 2:
-                        entry_name = parts[0].decode('utf-8', errors='ignore')
+                        entry_name = parts[0].decode('ascii', errors='ignore')
                         entry_size = int(parts[1])
                         parsed_entries.append(
                             {"type": "file", "name": entry_name, "size": entry_size})
@@ -275,29 +282,28 @@ class MavFtpClient:
         files = []
 
         while True:
-            path_bytes = remote_path.encode('utf-8')
-            payload = MavFtpPayload(seq_number=self._create_seq_number(), opcode=MavFtpOpcode.LIST_DIRECTORY, size=len(
-                path_bytes), offset=offset, data=path_bytes)
+            path_bytes = remote_path.encode('ascii')
+            payload = MavFtpPayload(
+                opcode=MavFtpOpcode.LIST_DIRECTORY,
+                size=len(path_bytes),
+                offset=offset,
+                data=path_bytes)
 
             try:
                 response = await self._send_message_with_ack(MavFtpMessage(payload=payload))
 
             except asyncio.CancelledError:
-                print("Error: Did not receive response for LIST_DIRECTORY request.")
+                self._logger.error("Did not receive response for LIST_DIRECTORY request.")
                 return
 
-            if response.opcode != MavFtpOpcode.ACK:
-                if response.opcode == MavFtpOpcode.NAK:
-                    error_code = self._parse_nak(response.data)
+            if response.opcode == MavFtpOpcode.NAK:
+                error_code = self._parse_nak(response.data)
 
-                    if error_code == MavFtpError.EOF:
-                        # Directory listings are always terminated with an EOF
-                        break
-                    else:
-                        print(f"Error: {error_code.name}")
-                        return
+                if error_code == MavFtpError.EOF:
+                    # Directory listings are always terminated with an EOF
+                    break
                 else:
-                    print("Error: Unexpected response. Expected opcode ACK or NAK.")
+                    self._logger.error(f"Unexpected error while listing directory \"{remote_path}\": {error_code.name}")
                     return
 
             files.extend(self._decode_directory_listing(response.data))
@@ -317,25 +323,20 @@ class MavFtpClient:
         if self._session is not None:
             payload = MavFtpPayload(
                 session=self._session,
-                seq_number=self._create_seq_number(),
                 opcode=MavFtpOpcode.TERMINATE_SESSION
             )
 
             try:
                 response = await self._send_message_with_ack(MavFtpMessage(payload=payload))
             except asyncio.CancelledError:
-                print("Error: Did not receive response for TERMINATE_SESSION request.")
+                self._logger.error("Did not receive response for TERMINATE_SESSION request.")
                 return
 
-
-            if response.opcode != MavFtpOpcode.ACK:
-                if response.opcode == MavFtpOpcode.NAK:
-                    error_code = self._parse_nak(response.data)
-                    print(f"CLOSING SESS Error: {error_code.name}")
-                    return
-                print("Error: Unexpected response. Expected opcode ACK.")
+            if response.opcode == MavFtpOpcode.NAK:
+                error_code = self._parse_nak(response.data)
+                self._logger.error(f"Unknown error while closing session: {error_code.name}")
                 return
-            
+
             self._session = None
             self._session_path = None
             self._session_type = None
@@ -346,17 +347,16 @@ class MavFtpClient:
             return await self._open_file_ro(path)
 
     async def _open_file_ro(self, path) -> bool:
-        if self._session is not None and self._session_path == path:
+        if self._session is not None and self._session_path == path and self._session_type == MavFtpOpcode.OPEN_FILE_RO:
             # Already open
             return True
 
         # Close any existing sessions, we only support one session at a time
         await self._close_session()
 
-        path_bytes = path.encode('utf-8')
+        path_bytes = path.encode('ascii')
 
         payload = MavFtpPayload(
-            seq_number=self._create_seq_number(),
             opcode=MavFtpOpcode.OPEN_FILE_RO,
             size=len(path_bytes),
             data=path_bytes,
@@ -365,20 +365,48 @@ class MavFtpClient:
         try:
             response = await self._send_message_with_ack(MavFtpMessage(payload=payload))
         except asyncio.CancelledError:
-            print("Error: Did not receive response for OPEN_FILE_RO request.")
             return False
 
-        if response.opcode != MavFtpOpcode.ACK:
-            if response.opcode == MavFtpOpcode.NAK:
-                error_code = self._parse_nak(response.data)
-                print(f"Error: {error_code.name}")
-                return False
-            print("Error: Unexpected response. Expected opcode ACK.")
+        if response.opcode == MavFtpOpcode.NAK:
+            error_code = self._parse_nak(response.data)
+            self._logger.log(f"Unknown error while opening file \"{path}\" for writing: {error_code.name}")
             return False
 
         self._session = response.session
         self._session_path = path
         self._session_type = MavFtpOpcode.OPEN_FILE_RO
+
+        return True
+
+    async def _open_file_wo(self, path) -> bool:
+        if self._session is not None and self._session_path == path and self._session_type == MavFtpOpcode.OPEN_FILE_WO:
+            # Already open
+            return True
+
+        # Close any existing sessions, we only support one session at a time
+        await self._close_session()
+
+        path_bytes = path.encode('ascii')
+
+        payload = MavFtpPayload(
+            opcode=MavFtpOpcode.OPEN_FILE_WO,
+            size=len(path_bytes),
+            data=path_bytes,
+        )
+
+        try:
+            response = await self._send_message_with_ack(MavFtpMessage(payload=payload))
+        except asyncio.CancelledError:
+            return False
+
+        if response.opcode == MavFtpOpcode.NAK:
+            error_code = self._parse_nak(response.data)
+            self._logger.log(f"Unknown error while opening file \"{path}\" for writing: {error_code.name}")
+            return False
+
+        self._session = response.session
+        self._session_path = path
+        self._session_type = MavFtpOpcode.OPEN_FILE_WO
 
         return True
 
@@ -408,11 +436,12 @@ class MavFtpClient:
                 break
             payload = MavFtpPayload(
                 session=self._session,
-                seq_number=self._create_seq_number(),
                 opcode=MavFtpOpcode.BURST_READ_FILE,
                 offset=next_missing[0],
+                seq_number=self._create_seq_number(),
                 size=MavFtpPayload.MAV_FTP_MAX_DATA_LEN,
             )
+            # We send the burst command separately, as it doesn't have ack response
             self._conn.mav.file_transfer_protocol_send(
                 target_network=0,
                 target_system=self._conn.target_system,
@@ -424,29 +453,225 @@ class MavFtpClient:
                 try:
                     decoded_response = await asyncio.wait_for(self._ftp_burst_q.get(), timeout=1)
                 except asyncio.TimeoutError:
-                    print("Timeout waiting for burst data.")
+                    self._logger.error("Timeout while waiting for burst read response")
                     break
 
                 if decoded_response.opcode == MavFtpOpcode.ACK:
                     received_data.mark_completed(decoded_response.offset, decoded_response.size, decoded_response.data)
                     if decoded_response.burst_complete:
                         break
-                elif decoded_response.opcode == MavFtpOpcode.NAK:
+                else:
                     error_code = self._parse_nak(decoded_response.data)
                     if error_code == MavFtpError.EOF:
                         received_data.eof(decoded_response.offset)
                         break
-                    print(f"Error: {error_code.name}")
+                    self._logger.error(f"Unexpected error while reading file \"{path}\": {error_code.name}")
                     return None
-                else:
-                    print("Error: Unexpected response. Expected opcode ACK or NAK.")
-                    return None
+
         data = received_data.get_data()
-        if len(data) > size: # Can get too much if burst goes over the requested size
+        if len(data) > size:  # Can get too much if burst goes over the requested size
             return data[:size]
         await self._close_session()
         return data
-    
+
+    async def create_file(self, path):
+        async with self._ftp_lock:
+            await self._clear_ftp_queue()
+            return await self._create_file(path)
+
+    async def _create_file(self, path):
+        if self._session is not None:
+            # Need to close the current before creating a new file
+            await self._close_session()
+
+        path_bytes = path.encode('ascii')
+        payload = MavFtpPayload(
+            opcode=MavFtpOpcode.CREATE_FILE,
+            size=len(path_bytes),
+            data=path_bytes
+        )
+
+        try:
+            response = await self._send_message_with_ack(MavFtpMessage(payload=payload))
+        except asyncio.CancelledError:
+            return False
+
+        if response.opcode == MavFtpOpcode.ACK:
+            # Response packet contains the session number
+            self._session = response.session
+            self._session_path = path
+            self._session_type = MavFtpOpcode.OPEN_FILE_WO
+            return True
+        else:
+            error_code = self._parse_nak(response.data)
+            self._logger.error(f"Unexpected error while creating file \"{path}\": {error_code.name}")
+            return False
+
+    async def create_directory(self, path):
+        async with self._ftp_lock:
+            await self._clear_ftp_queue()
+            return await self._create_directory(path)
+
+    async def _create_directory(self, path):
+        path_bytes = path.encode('ascii')
+        payload = MavFtpPayload(
+            opcode=MavFtpOpcode.CREATE_DIRECTORY,
+            size=len(path_bytes),
+            data=path_bytes
+        )
+
+        try:
+            response = await self._send_message_with_ack(MavFtpMessage(payload=payload))
+        except asyncio.CancelledError:
+            return False
+
+        if response.opcode == MavFtpOpcode.ACK:
+            return True
+        else:
+            error_code = self._parse_nak(response.data)
+            self._logger.error(f"Unexpected error while creating directory \"{path}\": {error_code.name}")
+            return False
+
+    async def remove_file(self, path):
+        async with self._ftp_lock:
+            await self._clear_ftp_queue()
+            return await self._remove_file(path)
+
+    async def _remove_file(self, path):
+        path_bytes = path.encode('ascii')
+        payload = MavFtpPayload(
+            opcode=MavFtpOpcode.REMOVE_FILE,
+            size=len(path_bytes),
+            data=path_bytes
+        )
+
+        try:
+            response = await self._send_message_with_ack(MavFtpMessage(payload=payload))
+        except asyncio.CancelledError:
+            return False
+
+        if response.opcode == MavFtpOpcode.ACK:
+            return True
+        else:
+            error_code = self._parse_nak(response.data)
+            self._logger.error(f"Unexpected error while removing file \"{path}\": {error_code.name}")
+            return False
+
+    async def remove_directory(self, path):
+        async with self._ftp_lock:
+            await self._clear_ftp_queue()
+            return await self._remove_directory(path)
+
+    async def _remove_directory(self, path):
+        path_bytes = path.encode('ascii')
+        payload = MavFtpPayload(
+            opcode=MavFtpOpcode.REMOVE_DIRECTORY,
+            size=len(path_bytes),
+            data=path_bytes
+        )
+
+        try:
+            response = await self._send_message_with_ack(MavFtpMessage(payload=payload))
+        except asyncio.CancelledError:
+            return False
+
+        if response.opcode == MavFtpOpcode.ACK:
+            return True
+        else:
+            error_code = self._parse_nak(response.data)
+            self._logger.error(f"Unexpected error while removing directory \"{path}\": {error_code.name}")
+            return False
+
+    async def write(self, path, offset, data):
+        async with self._ftp_lock:
+            await self._clear_ftp_queue()
+            return await self._write(path, offset, data)
+
+    async def _write(self, path, offset, data, max_retries=3):
+        # Check that the file is valid for writing
+        if (self._session is None or self._session_path != path or self._session_type != MavFtpOpcode.OPEN_FILE_WO):
+            if not await self._open_file_wo(path):
+                return False
+
+        payload = MavFtpPayload(
+            session=self._session,
+            opcode=MavFtpOpcode.WRITE_FILE,
+            offset=offset,
+            size=len(data),
+            data=data
+        )
+
+        retries = 0
+        while retries < max_retries:
+            if retries > 0:
+                self._logger.info(f"Retrying write {retries + 1}/{max_retries}")
+            try:
+                response = await self._send_message_with_ack(MavFtpMessage(payload=payload, max_retries=1))
+            except asyncio.CancelledError:
+                return False
+            if response.opcode == MavFtpOpcode.ACK:
+                return True
+            else:
+                error_code = self._parse_nak(response.data)
+                if error_code == MavFtpError.FAIL_FILE_PROTECTED:
+                    self._logger.error(f"Error: File \"{path}\" is protected.")
+                    # This can happen somtimes, resolve by closing and reopening the file
+                    await self._close_session()
+                    await asyncio.sleep(0.1)
+                else:
+                    self._logger.error(f"Unexpected error while writing file \"{path}\": {error_code.name}")
+            retries += 1
+
+    async def rename(self, old_path, new_path):
+        async with self._ftp_lock:
+            await self._clear_ftp_queue()
+            return await self._rename(old_path, new_path)
+
+    async def _rename(self, old_path, new_path):
+        enc_both = old_path.encode('ascii') + b'\0' + new_path.encode('ascii')
+        payload = MavFtpPayload(
+            opcode=MavFtpOpcode.RENAME,
+            size=len(enc_both),
+            data=enc_both
+        )
+
+        try:
+            response = await self._send_message_with_ack(MavFtpMessage(payload=payload))
+        except asyncio.CancelledError:
+            return False
+
+        if response.opcode == MavFtpOpcode.ACK:
+            return True
+        else:
+            error_code = self._parse_nak(response.data)
+            self._logger.log(f"Unexpected error while moving \"{old_path}\" to \"{new_path}\": {error_code.name}")
+            return False
+
+    async def truncate_file(self, path, size):
+        async with self._ftp_lock:
+            await self._clear_ftp_queue()
+            return await self._truncate_file(path, size)
+
+    async def _truncate_file(self, path, size):
+        path_bytes = path.encode('ascii')
+        payload = MavFtpPayload(
+            opcode=MavFtpOpcode.TRUNCATE_FILE,
+            size=len(path_bytes),
+            offset=size,
+        )
+
+        try:
+            response = await self._send_message_with_ack(MavFtpMessage(payload=payload))
+        except asyncio.CancelledError:
+            return False
+
+        if response.opcode == MavFtpOpcode.ACK:
+            return True
+        else:
+            error_code = self._parse_nak(response.data)
+            self._logger.log(f"Unexpected error while truncating file \"{path}\": {error_code.name}")
+            return False
+
     async def crc32(self, path):
         async with self._ftp_lock:
             await self._clear_ftp_queue()
@@ -454,9 +679,8 @@ class MavFtpClient:
 
     async def _crc32(self, path):
         # Ask the vehicle to calculate the CRC32 of the file
-        path_bytes = path.encode('utf-8')
+        path_bytes = path.encode('ascii')
         payload = MavFtpPayload(
-            seq_number=self._create_seq_number(),
             opcode=MavFtpOpcode.CALC_FILE_CRC32,
             size=len(path_bytes),
             data=path_bytes
@@ -465,15 +689,11 @@ class MavFtpClient:
         try:
             response = await self._send_message_with_ack(MavFtpMessage(payload=payload, timeout_s=30))
         except asyncio.CancelledError:
-            print("Error: Did not receive response for CALC_FILE_CRC32 request.")
             return None
 
         if response.opcode == MavFtpOpcode.ACK:
             return struct.unpack('<I', response.data)[0]
-        elif response.opcode == MavFtpOpcode.NAK:
-            error_code = self._parse_nak(response.data)
-            print(f"Error: {error_code.name}")
-            return None
         else:
-            print("Error: Unexpected response. Expected opcode ACK or NAK.")
+            error_code = self._parse_nak(response.data)
+            self._logger.log(f"Unexpected error while calculating CRC32 for file \"{path}\": {error_code.name}")
             return None
