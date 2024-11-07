@@ -1,10 +1,10 @@
-# mavFUSE
+# MAVFUSE
 My attempt at creating a FUSE3 filesystem over a MAVFTP connection.
 This makes it simple to transfer files to and from the SD card of a PX4 based drone without having to physically remove the SD card.
 
 Supports basic file operations like read, write, open, close, etc.
 
-**Note that since I started work on this, a MAVFTP implementation with experimental FUSE module has beed added to [pymavlink](https://github.com/ArduPilot/pymavlink). As of writing, it onlyprovides read support, and is unstable on my computer. However, with time, it will likely become the better option.**
+**Note that since I started work on this, a MAVFTP implementation with experimental FUSE module has beed added to [pymavlink](https://github.com/ArduPilot/pymavlink). As of writing, it only provides read support, and is unstable on my computer. However, with time, it will likely become the better option.**
 
 ## Installation
 1. Install FUSE3 system libraries (Ubuntu/Debian: `sudo apt install libfuse3-dev`)
