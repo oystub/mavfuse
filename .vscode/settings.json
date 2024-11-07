@@ -1,0 +1,6 @@
+{
+    "flake8.args": [
+        "--config",
+        ".flake8.cfg"
+    ]
+}
