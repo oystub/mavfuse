@@ -30,7 +30,7 @@ class MavFtpOpcode(Enum):
     NAK = 129
 
 
-class MavFtpError(Enum):
+class MavFtpBuiltinError(Enum):
     NONE = 0
     FAIL = 1
     FAILERRNO = 2
@@ -42,6 +42,16 @@ class MavFtpError(Enum):
     FAIL_FILE_EXISTS = 8
     FAIL_FILE_PROTECTED = 9
     FAIL_FILE_NOT_FOUND = 10
+
+
+class MavFtpError(Exception):
+    def __init__(self, message):
+        super().__init__(message)
+
+
+class MavFtpNotEmptyError(MavFtpError):
+    def __init__(self, message):
+        super().__init__(message)
 
 
 @dataclass
@@ -250,9 +260,9 @@ class MavFtpClient:
                 return
 
     @staticmethod
-    def _parse_nak(data) -> Optional[MavFtpError]:
+    def _parse_nak(data) -> Optional[MavFtpBuiltinError]:
         if len(data) > 0:
-            return MavFtpError(data[0])
+            return MavFtpBuiltinError(data[0])
         return None
 
     @staticmethod
@@ -303,7 +313,7 @@ class MavFtpClient:
             if response.opcode == MavFtpOpcode.NAK:
                 error_code = self._parse_nak(response.data)
 
-                if error_code == MavFtpError.EOF:
+                if error_code == MavFtpBuiltinError.EOF:
                     # Directory listings are always terminated with an EOF
                     break
                 else:
@@ -465,7 +475,7 @@ class MavFtpClient:
                         break
                 else:
                     error_code = self._parse_nak(decoded_response.data)
-                    if error_code == MavFtpError.EOF:
+                    if error_code == MavFtpBuiltinError.EOF:
                         received_data.eof(decoded_response.offset)
                         break
                     self._logger.error(f"Unexpected error while reading file \"{path}\": {error_code.name}")
@@ -582,6 +592,10 @@ class MavFtpClient:
             return True
         else:
             error_code = self._parse_nak(response.data)
+            # Check for not empty error
+            if error_code == MavFtpBuiltinError.FAILERRNO:
+                if ord(response.data[1:]) == 90:  # ENOTEMPTY
+                    raise MavFtpNotEmptyError(f"Directory \"{path}\" is not empty.")
             self._logger.error(f"Unexpected error while removing directory \"{path}\": {error_code.name}")
             return False
 
@@ -616,7 +630,7 @@ class MavFtpClient:
                 return True
             else:
                 error_code = self._parse_nak(response.data)
-                if error_code == MavFtpError.FAIL_FILE_PROTECTED:
+                if error_code == MavFtpBuiltinError.FAIL_FILE_PROTECTED:
                     self._logger.error(f"Error: File \"{path}\" is protected.")
                     # This can happen somtimes, resolve by closing and reopening the file
                     await self._close_session()

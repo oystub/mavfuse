@@ -14,7 +14,7 @@ from dataclasses import dataclass
 import pyfuse3
 import pyfuse3.asyncio
 
-from mavftp import MavFtpClient
+from mavftp import MavFtpClient, MavFtpNotEmptyError
 
 pyfuse3.asyncio.enable()
 
@@ -270,6 +270,7 @@ class MavFtpFS(pyfuse3.Operations):
             )
             self._files_by_inode[f.inode] = f
             self._files_by_path[f.path] = f
+            return await self.getattr(f.inode)
         else:
             raise pyfuse3.FUSEError(errno.EIO)
 
@@ -286,7 +287,9 @@ class MavFtpFS(pyfuse3.Operations):
         if file.type != 'file':
             raise pyfuse3.FUSEError(errno.EISDIR)
 
-        await self._client.remove_file(file.path)
+        if not await self._client.remove_file(file.path):
+            raise pyfuse3.FUSEError(errno.EIO)
+
         del self._files_by_path[full_path]
         del self._files_by_inode[file.inode]
 
@@ -302,8 +305,10 @@ class MavFtpFS(pyfuse3.Operations):
         file = self._files_by_path.get(full_path, None)
         if file.type != 'directory':
             raise pyfuse3.FUSEError(errno.ENOTDIR)
-
-        await self._client.remove_directory(file.path)
+        try:
+            await self._client.remove_directory(file.path)
+        except MavFtpNotEmptyError:
+            raise pyfuse3.FUSEError(errno.ENOTEMPTY)
         del self._files_by_path[full_path]
         del self._files_by_inode[file.inode]
 
