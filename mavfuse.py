@@ -100,7 +100,6 @@ class MavFtpFS(pyfuse3.Operations):
         if inode not in self._files_by_inode:
             raise pyfuse3.FUSEError(errno.ENOENT)
 
-
         # Check for O_TRUNC flag and write mode
         if flags & os.O_TRUNC and (flags & os.O_WRONLY or flags & os.O_RDWR):
             # Truncate the file to 0 bytes

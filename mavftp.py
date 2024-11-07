@@ -346,7 +346,7 @@ class MavFtpClient:
             await self._send_message(MavFtpMessage(payload=payload), await_ack=False)
             # Retry until we get a NAK for the first retry when the session is already closed
             try:
-                response = await self._send_message(MavFtpMessage(payload=payload), await_ack=True)
+                await self._send_message(MavFtpMessage(payload=payload), await_ack=True)
             except asyncio.CancelledError:
                 self._logger.error("Did not receive response for TERMINATE_SESSION request.")
 
